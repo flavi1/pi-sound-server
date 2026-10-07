@@ -25,6 +25,23 @@ CONF_DIR=/etc/pi-sound-server
 CONF="$CONF_DIR/audio-hub.conf"
 export DEBIAN_FRONTEND=noninteractive
 APT=(apt-get -o DPkg::Lock::Timeout=900 -y)
+# apt_run ARGS… : apt-get qui patiente si apt est déjà occupé (mises à jour
+# automatiques, autre installation). DPkg::Lock::Timeout ne couvre que le verrou
+# de dpkg, pas ceux du cache et des listes : on réessaie tant qu'un autre apt tourne.
+apt_busy() { pgrep -x 'apt-get|apt|dpkg|unattended-upgr' >/dev/null || pgrep -f 'apt.systemd.daily' >/dev/null; }
+apt_run() {
+    local i
+    for i in $(seq 1 120); do
+        while apt_busy; do
+            [[ $i -eq 1 ]] && echo "   apt est occupé (mises à jour automatiques ?) : attente…"
+            sleep 5
+        done
+        "${APT[@]}" "$@" && return 0
+        apt_busy || return 1      # échec réel (paquet introuvable…) : on s'arrête
+        sleep 5
+    done
+    return 1
+}
 log()  { printf '\n\033[1;35m[pi-sound-server]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 # lecture simple d'une clé dans une section INI : ini SECTION CLÉ
@@ -46,14 +63,14 @@ IRIS="$(ini mopidy iris)"
 
 # --- Paquets ------------------------------------------------------------------
 log "Paquets PipeWire / Mopidy"
-"${APT[@]}" update
-"${APT[@]}" install pipewire pipewire-bin wireplumber pipewire-alsa dbus-user-session \
+apt_run update
+apt_run install pipewire pipewire-bin wireplumber pipewire-alsa dbus-user-session \
     alsa-utils python3 python3-evdev \
     gstreamer1.0-pipewire gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly gstreamer1.0-libav \
     mopidy
 for p in mopidy-local mopidy-mpd; do
-    "${APT[@]}" install "$p" || warn "paquet $p indisponible dans les dépôts (voir README : installation pip)"
+    apt_run install "$p" || warn "paquet $p indisponible dans les dépôts (voir README : installation pip)"
 done
 
 # --- Utilisateur audio dédié -----------------------------------------------------
@@ -76,7 +93,7 @@ mkdir -p /media
 
 if [[ "${IRIS,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
     log "Interface web Iris (pip)"
-    "${APT[@]}" install python3-pip python3-setuptools python3-pykka
+    apt_run install python3-pip python3-setuptools python3-pykka
     # --no-deps : pip ne doit JAMAIS remplacer le Mopidy de Debian par celui de PyPI
     # (Iris demande seulement Mopidy >= 3.0, déjà fourni par apt).
     pip3 install --break-system-packages --root-user-action=ignore --no-deps --upgrade "Mopidy-Iris>=3.69,<4" \
