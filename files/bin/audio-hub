@@ -1346,21 +1346,30 @@ def mgmt_parse_info(data):
             "class": int.from_bytes(data[17:20], "little")}
 
 
-class Mgmt:
-    AF_BLUETOOTH, BTPROTO_HCI, HCI_DEV_NONE, HCI_CHANNEL_CONTROL = 31, 1, 0xFFFF, 3
+HCI_DEV_NONE = 0xFFFF
+HCI_CHANNEL_RAW, HCI_CHANNEL_MONITOR, HCI_CHANNEL_CONTROL = 0, 2, 3
 
+
+def hci_socket(dev, channel):
+    """Socket Bluetooth HCI lié à (appareil, canal). Python ne sait pas lier un canal
+    HCI : appel direct de socket()/bind() de la libc."""
+    import ctypes
+    AF_BLUETOOTH, BTPROTO_HCI = 31, 1
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.socket(AF_BLUETOOTH, socket.SOCK_RAW | socket.SOCK_CLOEXEC, BTPROTO_HCI)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "socket HCI")
+    addr = struct.pack("=HHH", AF_BLUETOOTH, dev, channel)
+    if libc.bind(fd, ctypes.create_string_buffer(addr, len(addr)), len(addr)) < 0:
+        err = ctypes.get_errno()
+        os.close(fd)
+        raise OSError(err, "bind HCI (canal %d)" % channel)
+    return fd
+
+
+class Mgmt:
     def __init__(self):
-        import ctypes
-        libc = ctypes.CDLL(None, use_errno=True)
-        fd = libc.socket(self.AF_BLUETOOTH, socket.SOCK_RAW | socket.SOCK_CLOEXEC, self.BTPROTO_HCI)
-        if fd < 0:
-            raise OSError(ctypes.get_errno(), "socket mgmt")
-        addr = struct.pack("=HHH", self.AF_BLUETOOTH, self.HCI_DEV_NONE, self.HCI_CHANNEL_CONTROL)
-        if libc.bind(fd, ctypes.create_string_buffer(addr, len(addr)), len(addr)) < 0:
-            err = ctypes.get_errno()
-            os.close(fd)
-            raise OSError(err, "bind mgmt")
-        self.fd = fd
+        self.fd = hci_socket(HCI_DEV_NONE, HCI_CHANNEL_CONTROL)
 
     def close(self):
         os.close(self.fd)
@@ -1458,6 +1467,74 @@ def rfkill_unblock():
                 log("Bluetooth débloqué (rfkill)")
         except OSError:
             pass
+
+
+# -----------------------------------------------------------------------------
+#  Contournement d'un défaut du noyau (constaté en 6.18) : un téléphone Android
+#  qui jumelle avec un code PIN le fait PENDANT l'établissement de la connexion.
+#  La clé arrive avant « Connect Complete » ; le noyau (hci_link_key_notify_evt
+#  -> hci_conn_drop, délai 0) abandonne alors cette connexion entrante comme si
+#  elle était sortante et l'oublie, alors que le contrôleur la garde ouverte : le
+#  téléphone parle dans le vide puis efface le jumelage. On écoute le moniteur
+#  HCI (comme btmon) et, dans ce cas précis, on coupe nous-mêmes la connexion
+#  orpheline : le téléphone, qui a gardé la clé, se reconnecte normalement.
+# -----------------------------------------------------------------------------
+HCI_MON_EVENT_PKT, HCI_MON_CTRL_EVENT = 3, 17
+HCI_EV_CONN_COMPLETE, HCI_EV_DISCONN_COMPLETE, HCI_EV_LINK_KEY_NOTIFY = 0x03, 0x05, 0x18
+MGMT_EV_CONNECT_FAILED = 0x000D
+
+
+def bdaddr_str(b):
+    return ":".join("%02X" % x for x in reversed(b))
+
+
+class OrphanWatch:
+    """Reçoit les paquets du moniteur HCI ; renvoie [(index, handle, adresse)] des
+    connexions à couper."""
+
+    def __init__(self, window=10.0, clock=time.monotonic):
+        self.window, self.clock = window, clock
+        self.early = {}        # (index, adresse) -> instant de la clé reçue trop tôt
+        self.handles = {}      # (index, adresse) -> handle (Connect Complete)
+
+    def feed(self, opcode, index, data):
+        now = self.clock()
+        out = []
+        if opcode == HCI_MON_EVENT_PKT and len(data) >= 2:
+            ev, p = data[0], data[2:]
+            if ev == HCI_EV_LINK_KEY_NOTIFY and len(p) >= 6:
+                key = (index, bytes(p[:6]))
+                if key not in self.handles:          # connexion pas encore établie
+                    self.early[key] = now
+            elif ev == HCI_EV_CONN_COMPLETE and len(p) >= 9 and p[0] == 0:
+                self.handles[(index, bytes(p[3:9]))] = struct.unpack_from("<H", p, 1)[0] & 0x0FFF
+            elif ev == HCI_EV_DISCONN_COMPLETE and len(p) >= 3:
+                h = struct.unpack_from("<H", p, 1)[0] & 0x0FFF
+                for k, v in list(self.handles.items()):
+                    if k[0] == index and v == h:
+                        del self.handles[k]
+                        self.early.pop(k, None)
+        elif opcode == HCI_MON_CTRL_EVENT and len(data) >= 12:
+            mev = struct.unpack_from("<H", data, 4)[0]
+            if mev == MGMT_EV_CONNECT_FAILED:
+                key = (index, bytes(data[6:12]))
+                t = self.early.pop(key, None)
+                h = self.handles.pop(key, None)
+                if t is not None and h is not None and now - t <= self.window:
+                    out.append((index, h, bdaddr_str(key[1])))
+        for k, t in list(self.early.items()):
+            if now - t > 60:
+                del self.early[k]
+        return out
+
+
+def hci_disconnect(index, handle, reason=0x13):
+    """Commande HCI « Disconnect » envoyée directement au contrôleur."""
+    fd = hci_socket(index, HCI_CHANNEL_RAW)
+    try:
+        os.write(fd, bytes([0x01, 0x06, 0x04, 3]) + struct.pack("<HB", handle, reason))
+    finally:
+        os.close(fd)
 
 
 def bt_controller_fix(mgmt, index):
@@ -1594,6 +1671,31 @@ def cmd_bluetooth(c):
                 log("enregistrement de l'agent impossible : %s" % ex)
         return True
 
+    watch = OrphanWatch()
+    try:
+        mon = hci_socket(HCI_DEV_NONE, HCI_CHANNEL_MONITOR)
+    except OSError as ex:
+        mon = None
+        log("moniteur HCI indisponible (%s) : jumelage Android par code PIN non rattrapé" % ex)
+
+    def on_monitor(fd, cond):
+        try:
+            pkt = os.read(fd, 4096)
+        except OSError:
+            return True
+        if len(pkt) >= 6:
+            op, idx, ln = struct.unpack_from("<HHH", pkt, 0)
+            for index, handle, addr in watch.feed(op, idx, pkt[6:6 + ln]):
+                log("%s : connexion abandonnée par le noyau juste après le jumelage "
+                    "(handle %d) : coupée pour que le téléphone se reconnecte" % (addr, handle))
+                try:
+                    hci_disconnect(index, handle)
+                except OSError as ex:
+                    log("coupure impossible : %s" % ex)
+        return True
+
+    if mon is not None:
+        GLib.io_add_watch(mon, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_monitor)
     reconcile()
     GLib.timeout_add_seconds(30, reconcile)
     loop.run()

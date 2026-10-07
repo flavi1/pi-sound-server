@@ -229,6 +229,13 @@ par code PIN**, et refuse toute demande de jumelage sans code. Contrepartie : un
 à 4 chiffres est moins robuste que le jumelage moderne ; suffisant pour une enceinte de
 salon, mais choisissez un code plus long si des voisins sont à portée.
 
+**Défaut du noyau contourné.** Un téléphone Android vérifie le code *pendant*
+l'établissement de la connexion ; le noyau Linux (constaté en 6.18) abandonne alors
+cette connexion sans la fermer, et le téléphone finit par effacer le jumelage. Le
+service le détecte (comme `btmon`) et coupe lui-même la connexion orpheline : le
+téléphone se reconnecte aussitôt avec la clé obtenue. Journal :
+`… connexion abandonnée par le noyau juste après le jumelage … coupée`.
+
 Gérer les téléphones jumelés :
 
 ```bash

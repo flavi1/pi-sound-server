@@ -109,6 +109,48 @@ fm.calls.clear()
 ah.bt_controller_fix(fm, 0)
 check(fm.calls == [("info",)], "déjà correct : aucune extinction ni modification")
 
+print("== connexion orpheline (défaut du noyau, jumelage Android par code PIN)")
+ADDR = bytes([0x0C, 0x75, 0xF2, 0x8B, 0x5A, 0xE8])          # E8:5A:8B:F2:75:0C
+OTHER = bytes([0x29, 0x78, 0xCB, 0x04, 0x12, 0xF0])
+
+
+def ev(code, params):
+    return bytes([code, len(params)]) + params
+
+
+def lk(a):
+    return ev(0x18, a + b"\x2a" * 16 + b"\x00")
+
+
+def cc(a, h, status=0):
+    return ev(0x03, bytes([status]) + struct.pack("<H", h) + a + b"\x01\x00")
+
+
+def cf(a):
+    return struct.pack("<IH", 2, 0x000D) + a + b"\x00\x0e"
+
+
+clock = [100.0]
+w = ah.OrphanWatch(clock=lambda: clock[0])
+# séquence relevée sur la Pi : clé, puis Connect Complete, puis Connect Failed
+out = w.feed(3, 0, lk(ADDR)) + w.feed(3, 0, cc(ADDR, 12)) + w.feed(17, 0, cf(ADDR))
+check(out == [(0, 12, "E8:5A:8B:F2:75:0C")], "clé reçue avant la connexion puis abandon : coupure du handle 12 (%s)" % out)
+
+w = ah.OrphanWatch(clock=lambda: clock[0])
+out = w.feed(3, 0, cc(OTHER, 13)) + w.feed(3, 0, lk(OTHER)) + w.feed(17, 0, cf(OTHER))
+check(out == [], "jumelage normal (clé après la connexion) : rien n'est coupé")
+
+w = ah.OrphanWatch(clock=lambda: clock[0])
+out = w.feed(3, 0, lk(ADDR)) + w.feed(3, 0, cc(ADDR, 12))
+check(out == [], "clé précoce mais le noyau garde la connexion : rien n'est coupé")
+w.feed(3, 0, ev(0x05, b"\x00" + struct.pack("<H", 12) + b"\x13"))
+check(w.feed(17, 0, cf(ADDR)) == [], "connexion déjà fermée : rien n'est coupé")
+
+w = ah.OrphanWatch(clock=lambda: clock[0])
+w.feed(3, 0, lk(ADDR)); w.feed(3, 0, cc(ADDR, 12))
+clock[0] += 30
+check(w.feed(17, 0, cf(ADDR)) == [], "abandon trop tardif (30 s) : pas lié au jumelage, rien n'est coupé")
+
 print()
 print("%d échec(s)" % FAILS)
 sys.exit(1 if FAILS else 0)
