@@ -42,6 +42,7 @@ import re
 import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -739,7 +740,7 @@ def apply_bluetooth(c):
         sc("disable", "--now", "bluetooth.service")
         log("  Bluetooth désactivé")
         return
-    if not shutil.which("btmgmt"):
+    if not shutil.which("bluetoothctl"):
         log("  BlueZ absent : relancez sudo bash /opt/pi-sound-server/install.sh")
         return
     sc("daemon-reload")
@@ -1328,17 +1329,67 @@ def cmd_links(c, args):
 AGENT_PATH = "/org/pisoundserver/bluetooth/agent"
 
 
-def mgmt_info(text):
-    """Sortie de « btmgmt info » -> {"settings": {...}, "class": int | None}."""
-    out = {"settings": set(), "class": None}
-    for l in text.splitlines():
-        l = l.strip()
-        if l.startswith("current settings:"):
-            out["settings"] = set(l.split(":", 1)[1].split())
-        m = re.search(r"\bclass (0x[0-9a-fA-F]+)", l)
-        if m:
-            out["class"] = int(m.group(1), 16)
-    return out
+# Interface « mgmt » du noyau (socket Bluetooth, canal de contrôle) : c'est ce
+# qu'utilise btmgmt, mais btmgmt se bloque sans terminal (service systemd).
+MGMT_SETTINGS = {0x1: "powered", 0x2: "connectable", 0x4: "fast-connectable",
+                 0x8: "discoverable", 0x10: "bondable", 0x20: "link-security",
+                 0x40: "ssp", 0x80: "br/edr", 0x200: "le", 0x400: "advertising",
+                 0x800: "secure-conn"}
+MGMT_READ_INFO, MGMT_SET_POWERED, MGMT_SET_SSP = 0x0004, 0x0005, 0x000B
+MGMT_SET_CLASS, MGMT_SET_SC = 0x000E, 0x002D
+
+
+def mgmt_parse_info(data):
+    """Réponse de « Read Controller Information » -> {"settings": {...}, "class": int}."""
+    cur = struct.unpack_from("<I", data, 13)[0]
+    return {"settings": {n for b, n in MGMT_SETTINGS.items() if cur & b},
+            "class": int.from_bytes(data[17:20], "little")}
+
+
+class Mgmt:
+    AF_BLUETOOTH, BTPROTO_HCI, HCI_DEV_NONE, HCI_CHANNEL_CONTROL = 31, 1, 0xFFFF, 3
+
+    def __init__(self):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.socket(self.AF_BLUETOOTH, socket.SOCK_RAW | socket.SOCK_CLOEXEC, self.BTPROTO_HCI)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "socket mgmt")
+        addr = struct.pack("=HHH", self.AF_BLUETOOTH, self.HCI_DEV_NONE, self.HCI_CHANNEL_CONTROL)
+        if libc.bind(fd, ctypes.create_string_buffer(addr, len(addr)), len(addr)) < 0:
+            err = ctypes.get_errno()
+            os.close(fd)
+            raise OSError(err, "bind mgmt")
+        self.fd = fd
+
+    def close(self):
+        os.close(self.fd)
+
+    def cmd(self, opcode, index, params=b"", timeout=5.0):
+        """Envoie une commande, renvoie (statut, données). Statut 0 = succès."""
+        os.write(self.fd, struct.pack("<HHH", opcode, index, len(params)) + params)
+        end = time.monotonic() + timeout
+        while True:
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([self.fd], [], [], left)[0]:
+                raise TimeoutError("mgmt 0x%04x sans réponse" % opcode)
+            pkt = os.read(self.fd, 4096)
+            if len(pkt) < 9:
+                continue
+            ev, idx, _ = struct.unpack_from("<HHH", pkt, 0)
+            op, status = struct.unpack_from("<HB", pkt, 6)
+            if ev in (0x0001, 0x0002) and op == opcode and idx == index:
+                return status, pkt[9:]
+
+    def info(self, index):
+        st, d = self.cmd(MGMT_READ_INFO, index)
+        if st != 0 or len(d) < 20:
+            raise OSError("lecture du contrôleur impossible (statut %d)" % st)
+        return mgmt_parse_info(d)
+
+    def set(self, opcode, index, *vals):
+        st, _ = self.cmd(opcode, index, bytes(vals))
+        return st
 
 
 def bt_make_agent(dbus, bus, pin, dev_name, is_paired):
@@ -1409,31 +1460,24 @@ def rfkill_unblock():
             pass
 
 
-def bt_mgmt(hci, *args):
-    try:
-        return subprocess.run(["btmgmt", "-i", hci] + list(args), text=True,
-                              capture_output=True, timeout=20).stdout or ""
-    except (OSError, subprocess.TimeoutExpired) as ex:
-        log("btmgmt %s : %s" % (" ".join(args), ex))
-        return ""
-
-
-def bt_controller_fix(hci):
+def bt_controller_fix(mgmt, index):
     """SSP coupé (code PIN obligatoire) et classe « haut-parleur ». Le SSP ne peut être
     désactivé que contrôleur éteint : extinction brève (une seule fois, au démarrage)."""
-    info = mgmt_info(bt_mgmt(hci, "info"))
+    info = mgmt.info(index)
     if "ssp" in info["settings"]:
-        log("%s : jumelage sans code (SSP) actif -> désactivé, code PIN obligatoire" % hci)
-        bt_mgmt(hci, "power", "off")
-        bt_mgmt(hci, "sc", "off")
-        bt_mgmt(hci, "ssp", "off")
-        bt_mgmt(hci, "power", "on")
-        info = mgmt_info(bt_mgmt(hci, "info"))
+        log("hci%d : jumelage sans code (SSP) actif -> désactivé, code PIN obligatoire" % index)
+        mgmt.set(MGMT_SET_POWERED, index, 0)
+        mgmt.set(MGMT_SET_SC, index, 0)
+        st = mgmt.set(MGMT_SET_SSP, index, 0)
+        mgmt.set(MGMT_SET_POWERED, index, 1)
+        info = mgmt.info(index)
         if "ssp" in info["settings"]:
-            log("%s : le contrôleur refuse de couper le SSP ; les jumelages sans code "
-                "restent refusés par l'agent" % hci)
-    if info["class"] is not None and (info["class"] & 0x1ffc) != BT_CLASS:
-        bt_mgmt(hci, "class", str(BT_CLASS >> 8), str(BT_CLASS & 0xfc))
+            log("hci%d : le contrôleur refuse de couper le SSP (statut %d) ; les jumelages "
+                "sans code restent refusés par l'agent" % (index, st))
+        else:
+            log("hci%d : jumelage par code PIN en place" % index)
+    if (info["class"] & 0x1ffc) != BT_CLASS:
+        mgmt.set(MGMT_SET_CLASS, index, BT_CLASS >> 8, BT_CLASS & 0xfc)
 
 
 def cmd_bluetooth(c):
@@ -1454,6 +1498,10 @@ def cmd_bluetooth(c):
     PROPS = "org.freedesktop.DBus.Properties"
     pin, name, disc = c.bt["pin"], c.bt_name, yes(c.bt["discoverable"])
     state = {"registered": False, "lost": False, "noadapter": False}
+    try:
+        mgmt = Mgmt()
+    except OSError as ex:
+        die("interface de gestion Bluetooth du noyau inaccessible : %s" % ex)
 
     def dev_get(path):
         try:
@@ -1513,7 +1561,12 @@ def cmd_bluetooth(c):
             return True
         state["noadapter"] = False
         for path in adapters:
-            bt_controller_fix(str(path).rsplit("/", 1)[-1])
+            m = re.search(r"hci(\d+)$", str(path))
+            if m:
+                try:
+                    bt_controller_fix(mgmt, int(m.group(1)))
+                except (OSError, TimeoutError) as ex:
+                    log("contrôleur %s : %s" % (path, ex))
             cur = dbus.Interface(bus.get_object("org.bluez", path), PROPS).GetAll("org.bluez.Adapter1")
             ap = dbus.Interface(bus.get_object("org.bluez", path), PROPS)
             for k, v in (("Powered", dbus.Boolean(True)), ("Alias", dbus.String(name)),

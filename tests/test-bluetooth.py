@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Test hors matériel de l'agent Bluetooth (faux D-Bus, faux btmgmt) :
+# Test hors matériel de l'agent Bluetooth (faux D-Bus, fausse interface mgmt) :
 #  - le code PIN répondu est celui de la configuration ;
 #  - tout jumelage SANS code (confirmation, « just works », passkey) est refusé ;
 #  - un service n'est autorisé que pour un appareil jumelé ;
-#  - le contrôleur est passé en jumelage par code PIN (SSP coupé) et en « haut-parleur ».
+#  - le contrôleur est passé en jumelage par code PIN (SSP coupé) et en « haut-parleur »,
+#    via l'interface mgmt du noyau (btmgmt se bloque sans terminal).
 import importlib.machinery, importlib.util, os, sys, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,41 +70,44 @@ check(agent.AuthorizeService("/org/bluez/hci0/dev_AA", "0000110b-0000-1000-8000-
 check(rejected(agent.AuthorizeService, "/org/bluez/hci0/dev_BB", "0000110b-0000-1000-8000-00805f9b34fb"),
       "service refusé pour un appareil non jumelé")
 
-print("== contrôleur (btmgmt)")
-INFO_SSP = """hci0:	Primary controller
-	addr DC:A6:32:00:00:00 version 9 manufacturer 305 class 0x6c0000
-	supported settings: powered connectable fast-connectable discoverable bondable link-security ssp br/edr le advertising secure-conn debug-keys privacy static-addr phy-configuration
-	current settings: powered bondable ssp br/edr le secure-conn
-	name hifi
-"""
-inf = ah.mgmt_info(INFO_SSP)
-check("ssp" in inf["settings"] and inf["class"] == 0x6c0000, "lecture de « btmgmt info »")
-
-CALLS = []
-STATE = {"ssp": True, "class": 0x6c0000}
+print("== contrôleur (interface mgmt du noyau)")
+import struct
+raw = (b"\xaa" * 6 + b"\x09" + struct.pack("<H", 305) + struct.pack("<I", 0xffff)
+       + struct.pack("<I", 0x1 | 0x10 | 0x40 | 0x80 | 0x200 | 0x800) + (0x6c0000).to_bytes(3, "little")
+       + b"hifi".ljust(249, b"\0") + b"\0" * 11)
+inf = ah.mgmt_parse_info(raw)
+check(inf["settings"] == {"powered", "bondable", "ssp", "br/edr", "le", "secure-conn"}
+      and inf["class"] == 0x6c0000, "lecture des réglages du contrôleur : %s" % sorted(inf["settings"]))
 
 
-def fake_mgmt(hci, *args):
-    CALLS.append(args)
-    if args == ("ssp", "off"):
-        STATE["ssp"] = False
-    if args[:1] == ("class",):
-        STATE["class"] = 0x6c0000 | (int(args[1]) << 8) | int(args[2])
-    if args == ("info",):
-        t = INFO_SSP if STATE["ssp"] else INFO_SSP.replace(" ssp br/edr", " br/edr")
-        return t.replace("class 0x6c0000", "class 0x%06x" % STATE["class"])
-    return ""
+class FakeMgmt:
+    def __init__(self):
+        self.calls = []
+        self.ssp, self.cls = True, 0x6c0000
+
+    def info(self, index):
+        self.calls.append(("info",))
+        return {"settings": {"powered", "ssp"} if self.ssp else {"powered"}, "class": self.cls}
+
+    def set(self, op, index, *vals):
+        self.calls.append((op,) + vals)
+        if op == ah.MGMT_SET_SSP:
+            self.ssp = bool(vals[0])
+        if op == ah.MGMT_SET_CLASS:
+            self.cls = 0x6c0000 | (vals[0] << 8) | vals[1]
+        return 0
 
 
-ah.bt_mgmt = fake_mgmt
-ah.bt_controller_fix("hci0")
-order = [a for a in CALLS if a != ("info",)]
-check(order[:4] == [("power", "off"), ("sc", "off"), ("ssp", "off"), ("power", "on")],
-      "SSP coupé contrôleur éteint, puis rallumé : %s" % order[:4])
-check(("class", "4", "20") in CALLS and (STATE["class"] & 0x1ffc) == 0x0414, "classe « haut-parleur »")
-CALLS.clear()
-ah.bt_controller_fix("hci0")
-check(CALLS == [("info",)], "déjà correct : aucune extinction ni modification")
+fm = FakeMgmt()
+ah.bt_controller_fix(fm, 0)
+order = [x for x in fm.calls if x != ("info",)]
+check(order[:4] == [(ah.MGMT_SET_POWERED, 0), (ah.MGMT_SET_SC, 0), (ah.MGMT_SET_SSP, 0),
+                    (ah.MGMT_SET_POWERED, 1)],
+      "SSP coupé contrôleur éteint, puis rallumé")
+check((ah.MGMT_SET_CLASS, 4, 20) in fm.calls and (fm.cls & 0x1ffc) == 0x0414, "classe « haut-parleur »")
+fm.calls.clear()
+ah.bt_controller_fix(fm, 0)
+check(fm.calls == [("info",)], "déjà correct : aucune extinction ni modification")
 
 print()
 print("%d échec(s)" % FAILS)
