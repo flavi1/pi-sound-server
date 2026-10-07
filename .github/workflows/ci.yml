@@ -33,5 +33,5 @@ jobs:
       - name: Outils PipeWire (spa-json-dump, si disponible)
         run: sudo apt-get update && sudo apt-get install -y pipewire-bin || true
       - run: bash tests/test-config.sh
-      - name: Knob (faux périphériques : HDMI-CEC + knob USB)
+      - name: "Knob (faux périphériques : HDMI-CEC + knob USB)"
         run: python3 tests/test-knob.py
