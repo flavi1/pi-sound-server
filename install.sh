@@ -82,6 +82,7 @@ ini() {
 mkdir -p "$CONF_DIR"
 [[ -f "$CONF" ]] || install -m 644 "$HERE/audio-hub.conf" "$CONF"
 install -m 755 "$F/bin/audio-hub" /usr/local/bin/audio-hub
+install -m 755 "$F/bin/audio-hub-diag" /usr/local/bin/audio-hub-diag
 AUSER="$(ini global user)"; AUSER="${AUSER:-hifi}"
 HP="$(ini mopidy http.port)"; HP="${HP:-6680}"
 MP="$(ini mopidy mpd.port)";  MP="${MP:-6600}"

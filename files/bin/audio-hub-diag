@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# =============================================================================
+#  audio-hub-diag — rapport de diagnostic complet du serveur de son
+#     sudo audio-hub diag                 (rapport à l'écran + fichier)
+#     sudo audio-hub diag --no-knob       (sans le test interactif du knob)
+#  Le rapport est enregistré dans /tmp/audio-hub-diag.txt (à envoyer tel quel).
+#  Pendant le diagnostic, idéalement : platine allumée, PC qui joue sur le
+#  S/PDIF, un morceau en lecture dans Mopidy.
+# =============================================================================
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "À lancer avec sudo."; exit 1; }
+KNOB=1; [[ "${1:-}" == "--no-knob" ]] && KNOB=0
+OUT=/tmp/audio-hub-diag.txt
+CONF=/etc/pi-sound-server/audio-hub.conf
+AUSER="$(awk -F= '/^\[global\]/{g=1;next} /^\[/{g=0} g && $1 ~ /^[[:space:]]*user[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$CONF" 2>/dev/null)"
+AUSER="${AUSER:-hifi}"
+AUID="$(id -u "$AUSER")"
+U() { runuser -u "$AUSER" -- env XDG_RUNTIME_DIR="/run/user/$AUID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$AUID/bus" "$@"; }
+SU() { systemctl --user -M "$AUSER@" "$@"; }
+sec() { printf '\n\n######## %s ########\n' "$*"; }
+
+{
+echo "audio-hub diag — $(date -Iseconds) — $(hostname) — $(uname -r)"
+echo "pi-sound-server : $(git -C /opt/pi-sound-server log -1 --format='%h %cs %s' 2>/dev/null)"
+
+sec "Services utilisateur ($AUSER)"
+for u in pipewire wireplumber audio-hub-init audio-hub-knob mopidy mopidy-scan.path; do
+    printf '  %-20s %s\n' "$u" "$(SU is-active "$u" 2>&1)"
+done
+
+sec "audio-hub status"
+audio-hub status 2>&1
+
+sec "wpctl status"
+U wpctl status 2>&1
+
+sec "pw-top (2 échantillons : pilote d'horloge, quantum, fréquence, erreurs/xruns)"
+U timeout 6 pw-top -b -n 2 2>&1 || echo "(pw-top indisponible)"
+
+sec "Volumes et sourdine (PipeWire)"
+for n in MASTER hub.out.amp hub.out.dac hub.in.spdif hub.in.turntable \
+         hub.loop.spdif.playback hub.loop.turntable.playback; do
+    id="$(U pw-cli ls Node 2>/dev/null | awk -v n="$n" '/^\tid /{id=$2} $0 ~ "node.name = \""n"\"" {gsub(",","",id); print id; exit}')"
+    [[ -n "$id" ]] && printf '  %-30s [%s] %s\n' "$n" "$id" "$(U wpctl get-volume "$id" 2>&1)" \
+                   || printf '  %-30s absent\n' "$n"
+done
+
+sec "Cartes son (ALSA)"
+cat /proc/asound/cards
+echo; aplay -l 2>&1; echo; arecord -l 2>&1
+
+sec "Paramètres réellement ouverts sur le matériel (hw_params)"
+for f in /proc/asound/card*/pcm*/sub*/hw_params; do
+    echo "--- $f"; cat "$f"
+done
+
+sec "Flux USB (fréquence/format négociés, état)"
+for f in /proc/asound/card*/stream*; do echo "--- $f"; cat "$f"; done
+
+sec "Mixeurs ALSA (volumes matériels, sourdines)"
+for c in $(awk '/^ *[0-9]+ \[/{print $1}' /proc/asound/cards); do
+    echo "--- carte $c : $(cat /proc/asound/card"$c"/id)"
+    amixer -c "$c" scontents 2>&1 | grep -E "Simple mixer|Playback|Capture|Mono|Front Left|Front Right|\[o" | head -n 40
+done
+
+sec "Configuration (audio-hub.conf, hors commentaires)"
+grep -vE '^\s*(#|$)' "$CONF"
+
+sec "Journal PipeWire / WirePlumber (démarrage courant)"
+journalctl _UID="$AUID" --user-unit=pipewire --user-unit=wireplumber -b --no-pager 2>&1 | tail -n 60
+
+sec "Journal knob / Mopidy"
+journalctl _UID="$AUID" --user-unit=audio-hub-knob --user-unit=audio-hub-init --user-unit=mopidy -b --no-pager 2>&1 | tail -n 50
+
+sec "Noyau (USB, son)"
+dmesg 2>/dev/null | grep -iE 'usb|snd|audio|iqaudio|pcm512|xrun|urb' | tail -n 50
+
+sec "Périphériques d'entrée (knob)"
+audio-hub knob-list 2>&1
+echo
+grep -E '^(N|H|B: EV|B: KEY|B: REL)' /proc/bus/input/devices
+} 2>&1 | tee "$OUT"
+
+if [[ $KNOB -eq 1 ]]; then
+    {
+    sec "Test du knob (événements bruts pendant 10 s)"
+    SU stop audio-hub-knob 2>/dev/null
+    echo ">>> TOURNEZ ET APPUYEZ SUR LE KNOB MAINTENANT (10 s)…"
+    python3 - <<'PY'
+import select, time
+try:
+    import evdev
+    from evdev import ecodes as e
+except ImportError:
+    print("python3-evdev absent"); raise SystemExit
+devs = []
+for p in evdev.list_devices():
+    try:
+        d = evdev.InputDevice(p); caps = d.capabilities()
+        if e.EV_KEY in caps or e.EV_REL in caps:
+            devs.append(d)
+    except OSError:
+        pass
+print("écoute :", ", ".join("%s (%s)" % (d.path, d.name) for d in devs) or "aucun")
+end = time.time() + 10; n = 0
+while time.time() < end:
+    r, _, _ = select.select([d.fd for d in devs], [], [], 0.5)
+    for d in devs:
+        if d.fd in r:
+            for ev in d.read():
+                if ev.type in (e.EV_KEY, e.EV_REL):
+                    n += 1
+                    if n <= 40:
+                        name = e.KEY.get(ev.code) if ev.type == e.EV_KEY else e.REL.get(ev.code)
+                        print("  %-22s %-6s %-24s valeur=%d" % (d.path, e.EV[ev.type], name, ev.value))
+print("%d événement(s) reçu(s)" % n)
+PY
+    SU start audio-hub-knob 2>/dev/null
+    } 2>&1 | tee -a "$OUT"
+fi
+echo
+echo "Rapport enregistré : $OUT"

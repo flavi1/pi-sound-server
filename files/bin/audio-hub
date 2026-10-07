@@ -12,6 +12,7 @@
 #                              pour écrire les lignes match.*
 #  sudo audio-hub status       état du routage (MASTER, entrées, sorties, liens)
 #  sudo audio-hub knob-list    périphériques d'entrée utilisables comme knob
+#  sudo audio-hub diag         rapport de diagnostic complet (+ test du knob)
 #  audio-hub check             valide le fichier et affiche ce qui serait généré
 #  audio-hub generate DIR      écrit les fichiers générés dans DIR (test)
 #  audio-hub boot-config FICHIER   affiche le config.txt qui serait écrit (test)
@@ -967,6 +968,8 @@ def main():
         cmd_init(c)
     elif cmd == "knob":
         cmd_knob(c)
+    elif cmd == "diag":
+        os.execvp("audio-hub-diag", ["audio-hub-diag"] + args[1:])
     elif cmd == "knob-list":
         cmd_knob_list(c)
     elif cmd == "boot-config":

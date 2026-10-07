@@ -18,8 +18,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: Syntaxe bash + ShellCheck
         run: |
-          for f in install.sh tests/*.sh; do bash -n "$f"; done
-          shellcheck -S warning install.sh tests/*.sh
+          for f in install.sh files/bin/audio-hub-diag tests/*.sh; do bash -n "$f"; done
+          shellcheck -S warning install.sh files/bin/audio-hub-diag tests/*.sh
       - name: Python (compilation + pyflakes)
         run: |
           python3 -m py_compile files/bin/audio-hub
