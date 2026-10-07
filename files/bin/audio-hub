@@ -13,6 +13,9 @@
 #  sudo audio-hub status       état du routage (MASTER, entrées, sorties, liens)
 #  sudo audio-hub knob-list    périphériques d'entrée utilisables comme knob
 #  sudo audio-hub diag         rapport de diagnostic complet (+ test du knob)
+#  sudo audio-hub volume       volume de MASTER (en % et en dB)
+#  sudo audio-hub volume watch affichage en direct (pour tester le knob)
+#  sudo audio-hub volume +5% | -5% | 40% | 0.4 | mute | unmute
 #  audio-hub check             valide le fichier et affiche ce qui serait généré
 #  audio-hub generate DIR      écrit les fichiers générés dans DIR (test)
 #  audio-hub boot-config FICHIER   affiche le config.txt qui serait écrit (test)
@@ -23,6 +26,7 @@
 # =============================================================================
 import configparser
 import json
+import math
 import os
 import pwd
 import re
@@ -38,7 +42,7 @@ GEN_HEADER = ("# Généré par « audio-hub apply » depuis %s\n"
               "# NE PAS ÉDITER : modifiez le fichier source puis relancez « sudo audio-hub apply ».\n\n")
 
 DEVICE_KEYS = {"description", "rate", "format", "driver-priority", "period-size",
-               "headroom", "enabled", "volume"}
+               "headroom", "enabled", "volume", "gain-db"}
 GLOBAL_DEFAULTS = {
     "user": "hifi",
     "master.name": "MASTER",
@@ -96,6 +100,13 @@ class Device:
         for k in ("rate", "driver-priority", "period-size", "headroom"):
             if k in self.opts and not self.opts[k].isdigit():
                 die("[%s.%s] %s doit être un entier" % (kind, ident, k))
+        if "gain-db" in self.opts:
+            try:
+                g = float(self.opts["gain-db"].replace("+", ""))
+            except ValueError:
+                die("[%s.%s] gain-db doit être un nombre (ex. 6 ou -3.5)" % (kind, ident))
+            if not -40 <= g <= 24:
+                die("[%s.%s] gain-db hors limites (-40 à +24 dB)" % (kind, ident))
         if "volume" in self.opts:
             try:
                 float(self.opts["volume"])
@@ -734,6 +745,29 @@ def cmd_status(c):
     print()
 
 
+# Volumes PipeWire (wpctl) : échelle cubique, amplitude = v³  =>  dB = 60·log10(v)
+def wpvol_to_db(v):
+    return 60.0 * math.log10(v) if v > 0 else float("-inf")
+
+
+def db_to_wpvol(db):
+    return (10 ** (db / 20.0)) ** (1.0 / 3.0)
+
+
+def fmt_volume(v, muted=False):
+    width = 30
+    n = max(0, min(width, int(round(v * width))))
+    db = wpvol_to_db(v)
+    dbs = "  -∞ dB" if db == float("-inf") else "%+6.1f dB" % db
+    return "MASTER %3d %%  [%s%s]  %s%s" % (round(v * 100), "#" * n, "-" * (width - n), dbs,
+                                          "  (SOURDINE)" if muted else "          ")
+
+
+def parse_wpctl_volume(out):
+    m = re.search(r"Volume:\s*([0-9.]+)", out or "")
+    return (float(m.group(1)) if m else None), ("MUTED" in (out or ""))
+
+
 def state_file(c):
     return os.path.join(c.home, ".local/state/audio-hub/volume")
 
@@ -775,10 +809,16 @@ def cmd_init(c):
     # Gains des entrées (nœuds de lecture des boucles)
     time.sleep(2)
     for d in c.inputs:
-        if d.enabled and "volume" in d.opts:
-            nid = node_id(c, "hub.loop.%s.playback" % d.id)
-            if nid is not None:
-                subprocess.run(["wpctl", "set-volume", str(nid), d.opts["volume"]])
+        if not d.enabled or not ("gain-db" in d.opts or "volume" in d.opts):
+            continue
+        if "gain-db" in d.opts:
+            vol = db_to_wpvol(float(d.opts["gain-db"].replace("+", "")))
+        else:
+            vol = float(d.opts["volume"])
+        nid = node_id(c, "hub.loop.%s.playback" % d.id)
+        if nid is not None:
+            subprocess.run(["wpctl", "set-volume", str(nid), "%.4f" % vol])
+            log("entrée %s : gain %+.1f dB" % (d.id, wpvol_to_db(vol)))
 
 
 # ----------------------------------------------------------------------------
@@ -810,9 +850,15 @@ class Master:
         if delta > 0:
             self._wpctl("set-mute", "@ID@", "0")
         self.dirty_since = time.monotonic()
+        v, muted = parse_wpctl_volume(self._wpctl("get-volume", "@ID@"))
+        if v is not None:
+            log("knob : " + fmt_volume(v, muted).strip())
 
     def toggle_mute(self):
         self._wpctl("set-mute", "@ID@", "toggle")
+        v, muted = parse_wpctl_volume(self._wpctl("get-volume", "@ID@"))
+        if v is not None:
+            log("knob : " + fmt_volume(v, muted).strip())
 
     def maybe_save(self):
         if self.dirty_since and time.monotonic() - self.dirty_since > 3:
@@ -983,6 +1029,48 @@ def cmd_knob(c):
                     master.change(step * (1 if ev.value > 0 else -1))
 
 
+def cmd_volume(c, args):
+    mid = node_id(c, c.master)
+    if mid is None:
+        die("MASTER introuvable (sudo audio-hub status)")
+
+    def get():
+        return parse_wpctl_volume(as_user(c, ["wpctl", "get-volume", str(mid)]).stdout)
+
+    if not args:
+        v, muted = get()
+        print(fmt_volume(v or 0.0, muted))
+        return
+    a = args[0].strip().lower()
+    if a == "watch":
+        print("Volume de MASTER en direct — tournez le knob (Ctrl+C pour quitter)")
+        last = None
+        try:
+            while True:
+                cur = get()
+                if cur != last and cur[0] is not None:
+                    sys.stdout.write("\r" + fmt_volume(*cur))
+                    sys.stdout.flush()
+                    last = cur
+                time.sleep(0.15)
+        except KeyboardInterrupt:
+            print()
+        return
+    if a in ("mute", "unmute", "toggle"):
+        as_user(c, ["wpctl", "set-mute", str(mid), {"mute": "1", "unmute": "0"}.get(a, "toggle")],
+                check=True)
+    else:
+        m = re.fullmatch(r"([+-]?)([0-9]*\.?[0-9]+)(%?)", a)
+        if not m:
+            die("valeur invalide : %s (ex. +5%%, -5%%, 40%%, 0.4, mute)" % a)
+        sign, num, pct = m.groups()
+        val = float(num) / (100.0 if pct else 1.0)
+        arg = "%.4f%s" % (val, sign) if sign else "%.4f" % val
+        as_user(c, ["wpctl", "set-volume", "-l", "%.3f" % c.max_volume, str(mid), arg], check=True)
+    v, muted = get()
+    print(fmt_volume(v or 0.0, muted))
+
+
 def cmd_boot_config(c, path):
     sys.stdout.write(boot_transform(open(path, encoding="utf-8").read(), c))
 
@@ -1012,6 +1100,8 @@ def main():
         cmd_init(c)
     elif cmd == "knob":
         cmd_knob(c)
+    elif cmd == "volume":
+        cmd_volume(c, args[1:])
     elif cmd == "diag":
         os.execvp("audio-hub-diag", ["audio-hub-diag"] + args[1:])
     elif cmd == "knob-list":

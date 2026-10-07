@@ -157,7 +157,7 @@ sudo audio-hub status     # MASTER, entrées/sorties présentes, liens actifs
 | | `driver-priority` | la plus haute présente fournit l'horloge |
 | | `period-size`, `headroom` | réglages ALSA fins (USB capricieux) |
 | | `enabled` | `no` pour garder la section sans l'utiliser |
-| `[input.<id>]` | mêmes clés + `volume` | gain de l'entrée dans MASTER (0..1) |
+| `[input.<id>]` | mêmes clés + `gain-db` | gain de l'entrée dans MASTER, en dB (-40 à +24) : équilibrer platine / PC / Mopidy |
 | `[boot]` | `manage`, `file`, `overlay`, `disable-onboard-audio`, `disable-hdmi-audio` | config.txt (voir plus haut) |
 | `[mopidy]` | `http.port`, `mpd.port`, `media-dirs`, `iris`, `scan-interval-minutes` | |
 | | `extra-codecs` | `no` : FLAC, MP3, OGG, Opus, WAV, AIFF. `yes` : + AAC/M4A/ALAC/WMA (ffmpeg, ≈ 300 Mo), puis relancer `install.sh` |
@@ -173,9 +173,25 @@ sudo audio-hub knob-list
 #     chemin stable : /dev/input/by-id/usb-XXXX_USB_Volume_Knob-event-if00
 ```
 
-Reportez le chemin stable dans `[knob] device = …` (ou laissez `auto`). Le démon gère
-les touches Volume+/Volume−/Mute et les molettes (`REL_DIAL`), survit au débranchement
-du knob, et mémorise le volume (restauré au redémarrage, plafonné à `master.max-volume`).
+En `auto` (défaut), tous les périphériques **USB** ayant des touches de volume ou une
+molette sont écoutés en même temps (les entrées HDMI-CEC de la Pi sont ignorées). Pour
+en imposer un : son chemin stable dans `[knob] device = …`.
+
+Le knob agit **uniquement sur le volume de MASTER** ; les appareils restent à volume fixe
+(100 %). Pour voir le volume en direct pendant qu'on tourne le knob :
+
+```bash
+sudo audio-hub volume watch      # MASTER  31 %  [#########-----]  -30.5 dB
+sudo audio-hub volume +5%        # ou -5%, 40%, mute, unmute
+```
+
+Le démon gère les touches Volume+/Volume−/Mute et les molettes (`REL_DIAL`), survit au
+débranchement du knob, et mémorise le volume (restauré au redémarrage, plafonné à
+`master.max-volume`). Chaque cran est aussi écrit dans son journal :
+`sudo journalctl -f _SYSTEMD_USER_UNIT=audio-hub-knob.service`.
+
+Sensibilité : `step` (0.02 par défaut) sur l'échelle de volume de PipeWire, soit
+environ 1 à 2 dB par cran dans la plage d'écoute habituelle.
 
 ## 4. Mopidy
 
@@ -216,12 +232,72 @@ cat /proc/asound/card*/pcm0p/sub0/hw_params   # idem pour le HAT (rate: 192000 a
 
 ## 7. Dépannage
 
+### Son « robotique » sur l'entrée S/PDIF : PC → adaptateur S/PDIF USB → Raspberry Pi
+
+**Scénario** : le son d'un PC sort par sa sortie optique (*« Audio interne — Stéréo
+numérique IEC958 »* sous Kubuntu), passe par la fibre optique vers l'adaptateur USB
+**HiFimeDIY UR23 USB SPDIF Rx** branché sur la Pi, puis dans MASTER. La platine et
+Mopidy sonnent bien, mais le son du PC est haché, métallique, « robotique ».
+
+**Cause** : un récepteur S/PDIF comme l'UR23 ne convertit pas la fréquence : il livre
+les échantillons au rythme du signal reçu, et la Pi doit l'ouvrir **exactement à cette
+fréquence**. L'UR23 (USB Audio Class 1) ne permet pas à la Pi de lire la fréquence
+entrante : elle est donc fixée dans `[input.spdif] rate = 96000`. Si le PC envoie du
+48 kHz (réglage par défaut de PipeWire sur un PC), les deux ne correspondent pas et
+aucun rééchantillonnage côté Pi ne peut corriger ce décalage. (Le rééchantillonnage
+96 → 192 kHz vers MASTER, lui, est fait automatiquement.)
+
+**Diagnostic** — sur le PC, pendant la lecture :
+
+```bash
+grep -H -E 'rate|format' /proc/asound/card*/pcm*p/sub0/hw_params
+#   rate: 48000 (48000/1)   ← différent de la Pi : son robotique
+```
+
+**Solution** — régler le PC sur la même fréquence que la Pi, en permanence. Kubuntu
+(PipeWire), en tant qu'utilisateur, sans sudo :
+
+```bash
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+cat > ~/.config/pipewire/pipewire.conf.d/50-96khz.conf <<'EOF'
+# Toute la sortie audio du PC à 96 kHz (S/PDIF vers la Raspberry Pi)
+context.properties = {
+    default.clock.rate          = 96000
+    default.clock.allowed-rates = [ 96000 ]
+}
+EOF
+systemctl --user restart pipewire pipewire-pulse wireplumber
+```
+
+Revérifier : `rate: 96000 (96000/1)`. Tout ce que joue le PC (44,1 / 48 kHz…) est
+alors converti en 96 kHz par le PC avant de partir sur la fibre. Pour annuler :
+supprimer ce fichier et relancer la même commande `systemctl`.
+
+Autres points :
+
+- Choisir une autre fréquence est possible, à condition de mettre **la même** des deux
+  côtés (`rate =` dans `[input.spdif]` puis `sudo audio-hub apply`). L'UR23 accepte
+  32 ; 44,1 ; 48 ; 88,2 et 96 kHz.
+- **Niveau** : le S/PDIF est numérique, son niveau dépend du volume de la sortie sur le
+  PC : la mettre à **100 %**, et régler l'écoute avec le knob (MASTER).
+- Si la fréquence est bonne et que le son reste haché : décrochages de l'adaptateur
+  (périphérique USB lent) → `period-size = 1024` et `headroom = 2048` dans
+  `[input.spdif]`, puis `sudo audio-hub apply`. `sudo audio-hub diag` (colonne ERR de
+  `pw-top`) permet de le vérifier.
+
+### Autres symptômes
+
 | Symptôme | Piste |
 |---|---|
-| `MASTER ABSENT` | `sudo journalctl _UID=$(id -u hifi) --user-unit=pipewire -b` : erreur de syntaxe ou module manquant |
+| `MASTER ABSENT` | `sudo journalctl -b _SYSTEMD_USER_UNIT=pipewire.service` : erreur de syntaxe ou module manquant |
+| Doute général | `sudo audio-hub diag` : rapport complet dans `/tmp/audio-hub-diag.txt` |
 | Appareil `absente` alors qu'il est branché | ses `match.*` ne correspondent pas : `sudo audio-hub list` |
 | Craquements | `clock.quantum = 2048`, puis `period-size = 1024` / `headroom = 1024` sur l'appareil USB ; baisser `resample.quality` si le CPU sature (`top`) |
-| L'adaptateur S/PDIF provoque des erreurs quand le PC est éteint | dépend de sa puce ; essayer `period-size = 1024`, `headroom = 2048` ; il n'est jamais horloge maître, le reste du système n'est pas affecté |
+| Son robotique / haché sur le S/PDIF | fréquence du PC ≠ `rate` de `[input.spdif]` : voir la section ci-dessus |
+| L'adaptateur S/PDIF provoque des erreurs quand le PC est éteint | dépend de sa puce ; essayer `period-size = 1024`, `headroom = 2048` ; il n'est jamais horloge maître |
+| Une source beaucoup plus faible que les autres (platine…) | `gain-db = 6` (par exemple) dans sa section `[input.…]`, puis `sudo audio-hub apply` |
+| Le knob ne semble rien faire | `sudo audio-hub volume watch` en le tournant ; sinon `sudo audio-hub diag` (test du knob, 10 s) |
+| Tout est faible | MASTER est bas (25 % ≈ -36 dB au premier démarrage) : `sudo audio-hub volume 60%` |
 | Pas de son du tout sur le HAT | `aplay -l` doit lister la carte ; sinon overlay `rpi-digiampplus,unmute_amp` dans `config.txt` |
-| Volume trop faible sur un appareil | son volume matériel : `wpctl set-volume <id> 1.0` (via la commande `runuser` ci-dessus) |
+| Volume trop faible sur un seul appareil | son volume matériel doit être à 100 % : `sudo audio-hub diag`, section « Mixeurs ALSA » ; sinon réglage propre de l'appareil (entrée, mode ligne/casque, son propre bouton de volume) |
 | Mopidy ne voit pas un disque | `sudo systemctl --user -M hifi@ start mopidy-scan`, `sudo journalctl _UID=$(id -u hifi) --user-unit=mopidy-scan` |

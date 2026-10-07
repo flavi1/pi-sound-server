@@ -47,7 +47,11 @@ echo "== erreurs de configuration détectées"
 printf '[global]\nfoo = 1\n' > "$W/bad1.conf"
 printf '[output.x]\ndescription = sans match\n' > "$W/bad2.conf"
 printf '[output.x]\nmatch.node.name = a\nrate = abc\n' > "$W/bad3.conf"
-for b in bad1 bad2 bad3; do
+printf '[input.x]\nmatch.node.name = a\ngain-db = 50\n' > "$W/bad4.conf"
+printf '[input.x]\nmatch.node.name = a\ngain-db = fort\n' > "$W/bad5.conf"
+printf '[input.x]\nmatch.node.name = a\ngain-db = +6\n' > "$W/good1.conf"
+if AUDIO_HUB_CONF="$W/good1.conf" "${HUB[@]}" check >/dev/null 2>&1; then ok "gain-db = +6 accepté"; else fail "gain-db = +6 refusé"; fi
+for b in bad1 bad2 bad3 bad4 bad5; do
     if AUDIO_HUB_CONF="$W/$b.conf" "${HUB[@]}" check >/dev/null 2>&1; then fail "$b accepté"; else ok "$b refusé"; fi
 done
 
