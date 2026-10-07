@@ -24,7 +24,8 @@
 #  audio-hub init              attend MASTER, le met par défaut, restaure le volume
 #  audio-hub knob              démon du bouton de volume USB
 #  audio-hub links             démon : relie chaque entrée à MASTER seulement
-#                              quand elle fournit réellement du son
+#                              quand elle fournit réellement du son, et rallume
+#                              les appareils USB revenus sur le profil « off »
 # =============================================================================
 import configparser
 import json
@@ -1075,14 +1076,21 @@ def cmd_volume(c, args):
     print(fmt_volume(v or 0.0, muted))
 
 
-def pw_graph(c):
-    """(nœuds par nom, ports par id, liens) depuis pw-dump."""
+def pw_dump(c):
     r = as_user(c, ["pw-dump"])
     if r.returncode != 0:
         return None
     try:
-        objs = json.loads(r.stdout)
+        return json.loads(r.stdout)
     except ValueError:
+        return None
+
+
+def pw_graph(c, objs=None):
+    """(nœuds par nom, ports par id, liens) depuis pw-dump."""
+    if objs is None:
+        objs = pw_dump(c)
+    if objs is None:
         return None
     nodes, ports, links = {}, {}, []
     for o in objs:
@@ -1099,9 +1107,9 @@ def pw_graph(c):
     return nodes, ports, links
 
 
-def links_step(c, verbose=False):
+def links_step(c, verbose=False, objs=None):
     """Un passage : relie / délie chaque boucle d'entrée selon l'état de sa capture."""
-    g = pw_graph(c)
+    g = pw_graph(c, objs)
     if g is None:
         return
     nodes, ports, links = g
@@ -1136,14 +1144,59 @@ def links_step(c, verbose=False):
             log("entrée %s : %s" % (d.id, "reliée" if linked else "absente"))
 
 
+def best_profile(dev):
+    """Pour un appareil ALSA USB resté sur le profil « off » : (index, nom) du meilleur
+    profil utilisable, sinon None."""
+    info = dev.get("info") or {}
+    props = info.get("props") or {}
+    usb = props.get("device.bus") == "usb" or str(props.get("device.name", "")).startswith("alsa_card.usb-")
+    if props.get("device.api") != "alsa" or not usb:
+        return None
+    params = info.get("params") or {}
+    cur = (params.get("Profile") or [{}])[0]
+    if cur.get("name") != "off":
+        return None
+    cands = [pr for pr in (params.get("EnumProfile") or [])
+             if pr.get("name") not in (None, "off") and pr.get("available") != "no"]
+    if not cands:
+        return None
+    pr = max(cands, key=lambda x: (x.get("priority", 0), x.get("available") == "yes"))
+    return pr.get("index"), pr.get("name")
+
+
+def profiles_step(c, objs, last_try):
+    """Un appareil USB revenu après une coupure (hub réinitialisé, DAC rallumé…) peut
+    rester sur le profil « off » : sans sortie ni entrée. On active son meilleur profil,
+    au plus une tentative toutes les 10 s par appareil."""
+    now = time.monotonic()
+    for o in objs:
+        if o.get("type") != "PipeWire:Interface:Device":
+            continue
+        bp = best_profile(o)
+        if bp is None:
+            continue
+        if now - last_try.get(o["id"], -1e9) < 10:
+            continue
+        last_try[o["id"]] = now
+        name = ((o.get("info") or {}).get("props") or {}).get("device.description", o["id"])
+        as_user(c, ["wpctl", "set-profile", str(o["id"]), str(bp[0])])
+        log("appareil « %s » resté sur le profil off : profil « %s » activé" % (name, bp[1]))
+
+
 def cmd_links(c, args):
     if args and args[0] == "once":
-        links_step(c, verbose=True)
+        objs = pw_dump(c) or []
+        links_step(c, verbose=True, objs=objs)
+        profiles_step(c, objs, {})
         return
-    log("audio-hub links : surveillance des entrées")
+    log("audio-hub links : surveillance des entrées et des profils USB")
+    last_try = {}
     while True:
         try:
-            links_step(c)
+            objs = pw_dump(c)
+            if objs is not None:
+                links_step(c, objs=objs)
+                profiles_step(c, objs, last_try)
         except Exception as ex:          # PipeWire en redémarrage, etc.
             log("links : %s" % ex)
         time.sleep(1.5)

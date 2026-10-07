@@ -69,7 +69,7 @@ def fake_as_user(c, cmd, check=False, capture=True):
     return R()
 
 
-ah.pw_graph = lambda c: graph()
+ah.pw_graph = lambda c, objs=None: graph()
 ah.as_user = fake_as_user
 ah.log = lambda m: None
 
@@ -95,6 +95,29 @@ print("== la platine est éteinte")
 STATE["turntable"].update({"cap": "suspended", "dev": False, "linked": True})
 CMDS.clear(); ah.links_step(c)
 check(len([x for x in CMDS if x[:2] == ["pw-link", "-d"]]) == 2, "platine absente : déliée (2 liens)")
+
+print("== appareil USB revenu sur le profil « off » (hub réinitialisé)")
+
+
+def dev(i, bus, cur, profiles, api="alsa"):
+    return {"id": i, "type": "PipeWire:Interface:Device",
+            "info": {"props": {"device.api": api, "device.bus": bus, "device.description": "dev%d" % i},
+                     "params": {"Profile": [{"index": cur[0], "name": cur[1]}],
+                                "EnumProfile": [dict(index=x[0], name=x[1], priority=x[2], available=x[3])
+                                                for x in profiles]}}}
+
+
+PROFS = [(0, "off", 0, "yes"), (1, "output:analog-stereo", 6500, "yes"), (2, "pro-audio", 1, "yes")]
+objs = [dev(145, "usb", (0, "off"), PROFS),                       # DAC revenu éteint
+        dev(146, "usb", (1, "output:analog-stereo"), PROFS),      # déjà actif
+        dev(59, "platform", (0, "off"), PROFS),                   # audio interne : non USB
+        dev(147, "usb", (0, "off"), [(0, "off", 0, "yes"), (1, "output:x", 10, "no")])]  # rien d'utilisable
+CMDS.clear(); last = {}
+ah.profiles_step(c, objs, last)
+check(CMDS == [["wpctl", "set-profile", "145", "1"]],
+      "seul le DAC USB éteint est rallumé, sur son meilleur profil : %s" % CMDS)
+CMDS.clear(); ah.profiles_step(c, objs, last)
+check(CMDS == [], "pas de nouvelle tentative avant 10 s")
 
 print()
 print("%d échec(s)" % FAILS)
