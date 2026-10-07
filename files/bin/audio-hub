@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# =============================================================================
+#  audio-hub — pi-sound-server (PipeWire + WirePlumber + Mopidy + knob)
+#
+#  Toute la configuration vient d'UN fichier : /etc/pi-sound-server/audio-hub.conf
+#
+#  sudo audio-hub apply        génère les configs PipeWire/WirePlumber/Mopidy,
+#                              met à jour /boot/firmware/config.txt (HAT, audio
+#                              intégré, HDMI) et redémarre la pile audio
+#  sudo audio-hub list         périphériques audio détectés + propriétés utiles
+#                              pour écrire les lignes match.*
+#  sudo audio-hub status       état du routage (MASTER, entrées, sorties, liens)
+#  sudo audio-hub knob-list    périphériques d'entrée utilisables comme knob
+#  audio-hub check             valide le fichier et affiche ce qui serait généré
+#  audio-hub generate DIR      écrit les fichiers générés dans DIR (test)
+#  audio-hub boot-config FICHIER   affiche le config.txt qui serait écrit (test)
+#
+#  Usage interne (services systemd de l'utilisateur audio) :
+#  audio-hub init              attend MASTER, le met par défaut, restaure le volume
+#  audio-hub knob              démon du bouton de volume USB
+# =============================================================================
+import configparser
+import json
+import os
+import pwd
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+CONF = os.environ.get("AUDIO_HUB_CONF", "/etc/pi-sound-server/audio-hub.conf")
+GEN_HEADER = ("# Généré par « audio-hub apply » depuis %s\n"
+              "# NE PAS ÉDITER : modifiez le fichier source puis relancez « sudo audio-hub apply ».\n\n")
+
+DEVICE_KEYS = {"description", "rate", "format", "driver-priority", "period-size",
+               "headroom", "enabled", "volume"}
+GLOBAL_DEFAULTS = {
+    "user": "hifi",
+    "master.name": "MASTER",
+    "master.description": "MASTER",
+    "clock.rate": "192000",
+    "clock.allowed-rates": "192000",
+    "clock.quantum": "1024",
+    "clock.min-quantum": "512",
+    "clock.max-quantum": "4096",
+    "resample.quality": "10",
+    "master.initial-volume": "0.25",
+    "master.max-volume": "1.0",
+    "latency-compensate": "false",
+    "disable-unlisted": "no",
+}
+KNOB_DEFAULTS = {"enabled": "yes", "device": "auto", "step": "0.02", "press": "mute", "grab": "yes"}
+BOOT_DEFAULTS = {"manage": "yes", "file": "auto", "overlay": "iqaudio-dacplus,unmute_amp",
+                 "disable-onboard-audio": "yes", "disable-hdmi-audio": "yes"}
+MOPIDY_DEFAULTS = {"enabled": "yes", "http.port": "6680", "mpd.port": "6600",
+                   "media-dirs": "/media", "iris": "yes", "scan-interval-minutes": "60"}
+
+
+def die(msg):
+    print("audio-hub: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def yes(v):
+    return str(v).strip().lower() in ("1", "yes", "true", "on", "oui")
+
+
+# =============================================================================
+#  Lecture et validation de la configuration
+# =============================================================================
+class Device:
+    def __init__(self, kind, ident, sec):
+        self.kind = kind          # "output" | "input"
+        self.id = ident
+        self.opts = {}
+        self.match = {}
+        for k, v in sec.items():
+            if k.startswith("match."):
+                self.match[k[6:]] = v.strip()
+            elif k in DEVICE_KEYS:
+                self.opts[k] = v.strip()
+            else:
+                die("[%s.%s] option inconnue : %s" % (kind, ident, k))
+        if not self.match:
+            die("[%s.%s] il faut au moins une ligne match.<propriété> = valeur" % (kind, ident))
+        for k in ("rate", "driver-priority", "period-size", "headroom"):
+            if k in self.opts and not self.opts[k].isdigit():
+                die("[%s.%s] %s doit être un entier" % (kind, ident, k))
+        if "volume" in self.opts:
+            try:
+                float(self.opts["volume"])
+            except ValueError:
+                die("[%s.%s] volume doit être un nombre (0.0..1.0)" % (kind, ident))
+
+    @property
+    def enabled(self):
+        return yes(self.opts.get("enabled", "yes"))
+
+    @property
+    def node_name(self):
+        return "hub.%s.%s" % ("out" if self.kind == "output" else "in", self.id)
+
+    @property
+    def description(self):
+        return self.opts.get("description", "%s %s" % (self.kind, self.id))
+
+
+class Config:
+    def __init__(self, path=CONF):
+        if not os.path.exists(path):
+            die("fichier introuvable : " + path)
+        cp = configparser.ConfigParser(interpolation=None, comment_prefixes=("#", ";"),
+                                       inline_comment_prefixes=None, strict=True)
+        cp.optionxform = str
+        try:
+            cp.read(path, encoding="utf-8")
+        except configparser.Error as e:
+            die("erreur de syntaxe dans %s :\n%s" % (path, e))
+        self.path = path
+        self.g = dict(GLOBAL_DEFAULTS)
+        self.knob = dict(KNOB_DEFAULTS)
+        self.mopidy = dict(MOPIDY_DEFAULTS)
+        self.boot = dict(BOOT_DEFAULTS)
+        self.outputs, self.inputs = [], []
+        for name in cp.sections():
+            sec = dict(cp.items(name))
+            if name == "global":
+                self._merge(self.g, sec, name)
+            elif name == "knob":
+                self._merge(self.knob, sec, name)
+            elif name == "mopidy":
+                self._merge(self.mopidy, sec, name)
+            elif name == "boot":
+                self._merge(self.boot, sec, name)
+            elif name.startswith("output.") or name.startswith("input."):
+                kind, ident = name.split(".", 1)
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", ident):
+                    die("[%s] identifiant invalide (lettres, chiffres, _ et -)" % name)
+                (self.outputs if kind == "output" else self.inputs).append(Device(kind, ident, sec))
+            else:
+                die("section inconnue : [%s]" % name)
+        for k in ("clock.rate", "clock.quantum", "clock.min-quantum", "clock.max-quantum",
+                  "resample.quality"):
+            if not self.g[k].isdigit():
+                die("[global] %s doit être un entier" % k)
+        self.allowed_rates = [int(x) for x in re.split(r"[\s,]+", self.g["clock.allowed-rates"].strip()) if x]
+        if int(self.g["clock.rate"]) not in self.allowed_rates:
+            self.allowed_rates.insert(0, int(self.g["clock.rate"]))
+        try:
+            pw = pwd.getpwnam(self.user)
+            self.uid, self.home = pw.pw_uid, pw.pw_dir
+        except KeyError:
+            self.uid, self.home = None, "/home/" + self.user
+
+    @staticmethod
+    def _merge(dst, src, name):
+        for k, v in src.items():
+            if k not in dst:
+                die("[%s] option inconnue : %s" % (name, k))
+            dst[k] = v.strip()
+
+    @property
+    def user(self):
+        return self.g["user"]
+
+    @property
+    def master(self):
+        return self.g["master.name"]
+
+    @property
+    def max_volume(self):
+        return min(1.5, max(0.0, float(self.g["master.max-volume"])))
+
+
+# =============================================================================
+#  Écriture SPA-JSON (format des fichiers PipeWire / WirePlumber)
+# =============================================================================
+def spa(v, ind=0):
+    pad, pad2 = "    " * ind, "    " * (ind + 1)
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        if all(not isinstance(x, (dict, list)) for x in v):
+            return "[ " + " ".join(spa(x) for x in v) + " ]"
+        return "[\n" + "".join(pad2 + spa(x, ind + 1) + "\n" for x in v) + pad + "]"
+    if isinstance(v, dict):
+        out = "{\n"
+        for k, x in v.items():
+            key = k if re.fullmatch(r"[A-Za-z0-9_.\-]+", k) else json.dumps(k)
+            out += "%s%s = %s\n" % (pad2, key, spa(x, ind + 1))
+        return out + pad + "}"
+    raise TypeError(v)
+
+
+def spa_top(d):
+    return "".join("%s = %s\n\n" % (k, spa(v)) for k, v in d.items())
+
+
+# =============================================================================
+#  Génération
+# =============================================================================
+def gen_pipewire(c):
+    master = c.master
+    stream_rules = []
+    for d in c.outputs:
+        if not d.enabled:
+            continue
+        stream_rules.append({
+            "matches": [{"media.class": "Audio/Sink", "node.name": d.node_name}],
+            "actions": {"create-stream": {}},
+        })
+    modules = [{
+        "name": "libpipewire-module-combine-stream",
+        "args": {
+            "combine.mode": "sink",
+            "node.name": master,
+            "node.description": c.g["master.description"],
+            "combine.latency-compensate": yes(c.g["latency-compensate"]),
+            "combine.props": {
+                "audio.position": ["FL", "FR"],
+                "priority.session": 3000,
+                "node.pause-on-idle": False,
+            },
+            "stream.props": {
+                "resample.quality": int(c.g["resample.quality"]),
+            },
+            "stream.rules": stream_rules,
+        },
+    }]
+    for d in c.inputs:
+        if not d.enabled:
+            continue
+        base = "hub.loop.%s" % d.id
+        modules.append({
+            "name": "libpipewire-module-loopback",
+            "args": {
+                "node.description": "%s -> %s" % (d.description, master),
+                "audio.position": ["FL", "FR"],
+                "capture.props": {
+                    "node.name": base + ".capture",
+                    "node.description": "%s (capture)" % d.description,
+                    "target.object": d.node_name,
+                    # Attendre l'appareil s'il est absent, ne jamais se rabattre
+                    # sur une autre entrée, se raccrocher seul à son retour.
+                    "node.dont-fallback": True,
+                    "node.linger": True,
+                    "node.dont-move": True,
+                    "resample.quality": int(c.g["resample.quality"]),
+                },
+                "playback.props": {
+                    "node.name": base + ".playback",
+                    "node.description": "%s -> %s" % (d.description, master),
+                    "target.object": master,
+                    "node.dont-fallback": True,
+                    "node.linger": True,
+                    "node.dont-move": True,
+                    "resample.quality": int(c.g["resample.quality"]),
+                },
+            },
+        })
+    doc = {
+        "context.properties": {
+            "default.clock.rate": int(c.g["clock.rate"]),
+            "default.clock.allowed-rates": c.allowed_rates,
+            "default.clock.quantum": int(c.g["clock.quantum"]),
+            "default.clock.min-quantum": int(c.g["clock.min-quantum"]),
+            "default.clock.max-quantum": int(c.g["clock.max-quantum"]),
+        },
+        "stream.properties": {"resample.quality": int(c.g["resample.quality"])},
+        "context.modules": modules,
+    }
+    return GEN_HEADER % c.path + spa_top(doc)
+
+
+def gen_client(c):
+    doc = {"stream.properties": {"resample.quality": int(c.g["resample.quality"])}}
+    return GEN_HEADER % c.path + spa_top(doc)
+
+
+def gen_wireplumber(c):
+    rules = []
+    # 1) Tous les nœuds ALSA : jamais de mise en veille (pas de « clac » sur
+    #    l'ampli, pas de latence au démarrage), éventuellement désactivés.
+    common = {"session.suspend-timeout-seconds": 0, "node.pause-on-idle": False}
+    if yes(c.g["disable-unlisted"]):
+        common["node.disabled"] = True
+    rules.append({"matches": [{"node.name": "~alsa_.*"}],
+                  "actions": {"update-props": common}})
+    # 2) Chaque candidat : renommé en hub.out.<id> / hub.in.<id> + réglages
+    for d in c.outputs + c.inputs:
+        if not d.enabled:
+            continue
+        m = {"media.class": "Audio/Sink" if d.kind == "output" else "Audio/Source"}
+        m.update(d.match)
+        props = {
+            "node.name": d.node_name,
+            "node.description": d.description,
+            "node.nick": d.description,
+            "node.disabled": False,
+            "priority.session": 500,
+            "resample.quality": int(c.g["resample.quality"]),
+        }
+        o = d.opts
+        if "rate" in o:
+            props["audio.rate"] = int(o["rate"])
+        if "format" in o:
+            props["audio.format"] = o["format"]
+        if "driver-priority" in o:
+            props["priority.driver"] = int(o["driver-priority"])
+        elif d.kind == "input":
+            props["priority.driver"] = 100     # une entrée ne pilote jamais l'horloge
+        if "period-size" in o:
+            props["api.alsa.period-size"] = int(o["period-size"])
+        if "headroom" in o:
+            props["api.alsa.headroom"] = int(o["headroom"])
+        rules.append({"matches": [m], "actions": {"update-props": props}})
+    doc = {
+        "wireplumber.settings": {
+            # Volume matériel des nouveaux appareils : 100 % (c'est MASTER qui règle)
+            "device.routes.default-sink-volume": 1.0,
+            "device.routes.default-source-volume": 1.0,
+        },
+        # Pas de réservation D-Bus des cartes son (aucune session graphique)
+        "monitor.alsa.properties": {"alsa.reserve": False},
+        "monitor.alsa.rules": rules,
+    }
+    return GEN_HEADER % c.path + spa_top(doc)
+
+
+def gen_mopidy(c):
+    m = c.mopidy
+    dirs = [x.strip() for x in m["media-dirs"].split(",") if x.strip()]
+    file_dirs = "\n".join("    %s|%s" % (p, os.path.basename(p.rstrip("/")) or p) for p in dirs)
+    iris = yes(m["iris"])
+    excl = ".directory .html .jpeg .jpg .log .nfo .pdf .png .txt .zip .cue .m3u .db .ini .gif .bmp .webp"
+    return (GEN_HEADER % c.path) + """[core]
+restore_state = true
+
+[logging]
+verbosity = 0
+
+[audio]
+# Mopidy joue dans MASTER, qui distribue vers toutes les sorties
+output = pipewiresink target-object={master} client-name=Mopidy
+mixer = software
+mixer_volume = 100
+
+[http]
+enabled = true
+hostname = ::
+port = {http}
+{default_app}
+[mpd]
+enabled = true
+hostname = ::
+port = {mpd}
+
+[file]
+enabled = true
+media_dirs =
+{file_dirs}
+follow_symlinks = false
+show_dotfiles = false
+excluded_file_extensions = {excl}
+
+[local]
+enabled = true
+media_dir = {local_dir}
+excluded_file_extensions = {excl}
+
+[m3u]
+enabled = true
+
+[stream]
+enabled = true
+{iris_sec}""".format(master=c.master, http=m["http.port"], mpd=m["mpd.port"],
+                     default_app="default_app = iris\n" if iris else "",
+                     file_dirs=file_dirs, excl=excl, local_dir=dirs[0] if dirs else "/media",
+                     iris_sec="\n[iris]\ncountry = FR\nlocale = fr_FR\n" if iris else "")
+
+
+def gen_scan_timer(c):
+    mins = max(5, int(c.mopidy["scan-interval-minutes"] or 60))
+    return """# Généré par audio-hub
+[Unit]
+Description=Réindexation périodique de la bibliothèque Mopidy
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec={m}min
+
+[Install]
+WantedBy=timers.target
+""".format(m=mins)
+
+
+# =============================================================================
+#  /boot/firmware/config.txt : HAT, audio intégré, audio HDMI
+# =============================================================================
+BOOT_BEGIN = "# >>> pi-sound-server"
+BOOT_END = "# <<< pi-sound-server"
+BOOT_OFF = "#pi-sound-server# "      # préfixe des lignes désactivées (réversible)
+
+
+def boot_file(c):
+    f = c.boot["file"].strip()
+    if f and f != "auto":
+        return f
+    for cand in ("/boot/firmware/config.txt", "/boot/config.txt"):
+        if os.path.exists(cand):
+            return cand
+    return "/boot/firmware/config.txt"
+
+
+def boot_transform(text, c):
+    """Renvoie le nouveau config.txt. Toutes les modifications sont réversibles :
+    - bloc « pi-sound-server » (overlay du HAT) remplacé à chaque passage ;
+    - dtparam=audio=on commenté avec un préfixe reconnaissable ;
+    - paramètre « noaudio » ajouté/retiré sur la ligne dtoverlay=vc4-kms-v3d."""
+    lines = text.splitlines()
+    out, inside = [], False
+    for l in lines:                       # 1) retirer l'ancien bloc
+        if l.strip() == BOOT_BEGIN:
+            inside = True
+            continue
+        if l.strip() == BOOT_END:
+            inside = False
+            continue
+        if not inside:
+            out.append(l)
+    while out and not out[-1].strip():
+        out.pop()
+    manage = yes(c.boot["manage"])
+    off_onboard = manage and yes(c.boot["disable-onboard-audio"])
+    off_hdmi = manage and yes(c.boot["disable-hdmi-audio"])
+    res = []
+    for l in out:
+        # 2) audio intégré (jack 3,5 mm)
+        if l.startswith(BOOT_OFF):
+            orig = l[len(BOOT_OFF):]
+            res.append(BOOT_OFF + orig if off_onboard else orig)
+            continue
+        if re.match(r"^\s*dtparam=audio=on\s*$", l) and off_onboard:
+            res.append(BOOT_OFF + l)
+            continue
+        # 3) audio HDMI : paramètre noaudio de l'overlay vidéo KMS
+        m = re.match(r"^(\s*dtoverlay=vc4-(?:f)?kms-v3d[^,\s]*)((?:,[^\s#]*)?)(\s*(?:#.*)?)$", l)
+        if m:
+            params = [p for p in m.group(2).split(",") if p]
+            params = [p for p in params if p != "noaudio"]
+            if off_hdmi:
+                params.append("noaudio")
+            res.append(m.group(1) + "".join("," + p for p in params) + m.group(3))
+            continue
+        res.append(l)
+    if manage:
+        res += ["", BOOT_BEGIN,
+                "# Géré par « audio-hub apply » depuis %s — ne pas éditer ce bloc." % c.path,
+                "[all]"]
+        if off_onboard:
+            res.append("dtparam=audio=off")
+        ov = c.boot["overlay"].strip()
+        if ov and ov.lower() != "none":
+            res.append("dtoverlay=" + ov)
+        res.append(BOOT_END)
+    return "\n".join(res) + "\n"
+
+
+def apply_boot(c):
+    """Écrit config.txt si nécessaire. Renvoie True si un redémarrage est requis."""
+    path = boot_file(c)
+    if not os.path.exists(path):
+        log("  %s absent : configuration de démarrage ignorée" % path)
+        return False
+    old = open(path, encoding="utf-8").read()
+    new = boot_transform(old, c)
+    if new == old:
+        log("  %s : inchangé" % path)
+        return False
+    bak = path + ".pi-sound-server.orig"
+    if not os.path.exists(bak):
+        shutil.copy2(path, bak)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new)
+    os.replace(tmp, path)
+    os.sync()
+    open("/var/run/reboot-required", "a").close()
+    log("  %s mis à jour (sauvegarde : %s)" % (path, bak))
+    log("  ** REDÉMARRAGE NÉCESSAIRE pour le HAT / l'audio intégré : sudo reboot **")
+    return True
+
+
+def gen_scan_path(c):
+    return """# Généré par audio-hub
+# Un dossier apparaît / disparaît dans /media (disque branché, débranché, peu
+# importe qui l'a monté) => réindexation de la bibliothèque Mopidy.
+[Unit]
+Description=Surveillance de {d} pour Mopidy
+
+[Path]
+PathChanged={d}
+Unit=mopidy-scan.service
+
+[Install]
+WantedBy=default.target
+""".format(d=[x.strip() for x in c.mopidy["media-dirs"].split(",") if x.strip()][0])
+
+
+def generated_files(c):
+    """chemin relatif au HOME de l'utilisateur -> contenu"""
+    return {
+        ".config/pipewire/pipewire.conf.d/50-audio-hub.conf": gen_pipewire(c),
+        ".config/pipewire/client.conf.d/50-audio-hub.conf": gen_client(c),
+        ".config/wireplumber/wireplumber.conf.d/50-audio-hub.conf": gen_wireplumber(c),
+        ".config/mopidy/mopidy.conf": gen_mopidy(c),
+        ".config/systemd/user/mopidy-scan.timer": gen_scan_timer(c),
+        ".config/systemd/user/mopidy-scan.path": gen_scan_path(c),
+    }
+
+
+# =============================================================================
+#  Exécution en tant qu'utilisateur audio
+# =============================================================================
+def user_env(c):
+    env = dict(os.environ)
+    env["XDG_RUNTIME_DIR"] = "/run/user/%d" % c.uid
+    env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/%d/bus" % c.uid
+    return env
+
+
+def as_user(c, cmd, check=False, capture=True):
+    if c.uid is None:
+        die("l'utilisateur « %s » n'existe pas (lancez l'installeur)" % c.user)
+    if os.geteuid() == c.uid:
+        full = cmd
+    elif os.geteuid() == 0:
+        full = ["runuser", "-u", c.user, "--"] + cmd
+    else:
+        die("à lancer avec sudo (ou en tant que « %s »)" % c.user)
+    r = subprocess.run(full, env=user_env(c), text=True,
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None)
+    if check and r.returncode != 0:
+        die("échec : %s\n%s" % (" ".join(cmd), (r.stderr or "").strip()))
+    return r
+
+
+def systemctl_user(c, *args):
+    if os.geteuid() == c.uid:
+        cmd = ["systemctl", "--user"] + list(args)
+    else:
+        cmd = ["systemctl", "--user", "-M", "%s@" % c.user] + list(args)
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def pw_nodes(c):
+    r = as_user(c, ["pw-dump"])
+    if r.returncode != 0:
+        return []
+    try:
+        objs = json.loads(r.stdout)
+    except ValueError:
+        return []
+    out = []
+    for o in objs:
+        if o.get("type") == "PipeWire:Interface:Node":
+            props = (o.get("info") or {}).get("props") or {}
+            out.append((o["id"], props, (o.get("info") or {}).get("state")))
+    return out
+
+
+def node_id(c, name):
+    for nid, props, _ in pw_nodes(c):
+        if props.get("node.name") == name:
+            return nid
+    return None
+
+
+# =============================================================================
+#  Commandes
+# =============================================================================
+def write_owned(path, content, uid, gid, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    d = os.path.dirname(path)
+    # remonter les dossiers créés sous le HOME pour leur donner le bon propriétaire
+    while d and d != "/" and uid is not None:
+        try:
+            st = os.stat(d)
+        except FileNotFoundError:
+            break
+        if st.st_uid == uid:
+            break
+        if d.count("/") <= 2:   # ne jamais toucher /home ni le HOME lui-même ici
+            break
+        os.chown(d, uid, gid)
+        d = os.path.dirname(d)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(path, mode)
+    if uid is not None:
+        os.chown(path, uid, gid)
+
+
+def cmd_check(c):
+    print("Configuration valide : %s" % c.path)
+    print("  utilisateur  : %s" % c.user)
+    print("  MASTER       : %s @ %s Hz (autorisées : %s)" % (c.master, c.g["clock.rate"], c.allowed_rates))
+    for d in c.outputs:
+        print("  sortie %-12s -> %-22s %s %s" % (d.id, d.node_name, "" if d.enabled else "[désactivée]", d.match))
+    for d in c.inputs:
+        print("  entrée %-12s -> %-22s %s %s" % (d.id, d.node_name, "" if d.enabled else "[désactivée]", d.match))
+    print("  knob         : %s (%s)" % ("actif" if yes(c.knob["enabled"]) else "inactif", c.knob["device"]))
+    print("  mopidy       : %s" % ("actif" if yes(c.mopidy["enabled"]) else "inactif"))
+
+
+def cmd_generate(c, outdir):
+    for rel, content in generated_files(c).items():
+        p = os.path.join(outdir, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+        print("écrit", p)
+
+
+def cmd_apply(c):
+    if os.geteuid() != 0:
+        die("« apply » doit être lancé avec sudo")
+    if c.uid is None:
+        die("l'utilisateur « %s » n'existe pas : lancez install.sh" % c.user)
+    gid = pwd.getpwnam(c.user).pw_gid
+    cmd_check(c)
+    log("Démarrage (config.txt) :")
+    apply_boot(c)
+    log("Pile audio :")
+    for rel, content in generated_files(c).items():
+        p = os.path.join(c.home, rel)
+        write_owned(p, content, c.uid, gid)
+        log("  écrit " + p)
+
+    systemctl_user(c, "daemon-reload")
+    knob = yes(c.knob["enabled"])
+    mop = yes(c.mopidy["enabled"])
+    systemctl_user(c, "enable", "pipewire.socket", "pipewire.service", "wireplumber.service",
+                   "audio-hub-init.service")
+    for unit, on in (("audio-hub-knob.service", knob), ("mopidy.service", mop),
+                     ("mopidy-scan.timer", mop), ("mopidy-scan.path", mop)):
+        if on:
+            systemctl_user(c, "enable", unit)
+        else:
+            systemctl_user(c, "disable", "--now", unit)
+    log("Redémarrage de la pile audio…")
+    r = systemctl_user(c, "restart", "pipewire.service", "wireplumber.service")
+    if r.returncode != 0:
+        die("redémarrage PipeWire impossible :\n" + r.stderr)
+    systemctl_user(c, "restart", "audio-hub-init.service")
+    if knob:
+        systemctl_user(c, "restart", "audio-hub-knob.service")
+    if mop:
+        systemctl_user(c, "restart", "mopidy.service")
+        systemctl_user(c, "restart", "mopidy-scan.timer", "mopidy-scan.path")
+    time.sleep(2)
+    cmd_status(c)
+
+
+def cmd_list(c):
+    nodes = pw_nodes(c)
+    if not nodes:
+        die("PipeWire ne répond pas (sudo audio-hub status, journalctl _UID=$(id -u %s) --user-unit=pipewire)" % c.user)
+    keys = ["node.description", "alsa.card_name", "alsa.long_card_name", "device.vendor.id",
+            "device.product.id", "device.serial", "api.alsa.path", "audio.rate"]
+    for cls in ("Audio/Sink", "Audio/Source"):
+        print("\n==== %s ====" % ("SORTIES (Audio/Sink)" if cls == "Audio/Sink" else "ENTRÉES (Audio/Source)"))
+        for nid, p, state in nodes:
+            if p.get("media.class") != cls:
+                continue
+            print("\n  [%s] node.name = %s   (état : %s)" % (nid, p.get("node.name"), state))
+            for k in keys:
+                if k in p:
+                    print("       %-20s = %s" % (k, p[k]))
+    print("\nExemple de ligne à copier dans audio-hub.conf :")
+    print("  match.node.name = ~alsa_output\\.usb-Fabricant_Produit.*")
+
+
+def cmd_status(c):
+    nodes = pw_nodes(c)
+    if not nodes:
+        print("PipeWire ne répond pas pour l'utilisateur %s." % c.user)
+        return
+    by = {p.get("node.name"): (nid, p, st) for nid, p, st in nodes}
+    print("\n== MASTER ==")
+    if c.master in by:
+        r = as_user(c, ["wpctl", "get-volume", str(by[c.master][0])])
+        print("  %s [%s] %s" % (c.master, by[c.master][0], (r.stdout or "").strip()))
+    else:
+        print("  %s ABSENT (voir : journalctl _UID=$(id -u %s) --user-unit=pipewire)" % (c.master, c.user))
+    for title, devs in (("SORTIES", c.outputs), ("ENTRÉES", c.inputs)):
+        print("\n== %s ==" % title)
+        for d in devs:
+            if not d.enabled:
+                print("  %-12s désactivée" % d.id)
+            elif d.node_name in by:
+                nid, p, st = by[d.node_name]
+                print("  %-12s PRÉSENTE  [%s] %s  état=%s  %s Hz" % (
+                    d.id, nid, d.description, st, p.get("audio.rate", "?")))
+            else:
+                print("  %-12s absente   (%s)" % (d.id, d.description))
+    print("\n== LIENS ==")
+    r = as_user(c, ["pw-link", "-l"])
+    shown = False
+    for line in (r.stdout or "").splitlines():
+        if "hub." in line or c.master in line:
+            print("  " + line)
+            shown = True
+    if not shown:
+        print("  (aucun)")
+    for unit in ("audio-hub-knob.service", "mopidy.service"):
+        r = systemctl_user(c, "is-active", unit)
+        print("\n%s : %s" % (unit, (r.stdout or "").strip()), end="")
+    print()
+
+
+def state_file(c):
+    return os.path.join(c.home, ".local/state/audio-hub/volume")
+
+
+def read_saved_volume(c):
+    try:
+        with open(state_file(c)) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def save_volume(c, v):
+    p = state_file(c)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("%.4f\n" % v)
+    os.replace(tmp, p)
+
+
+def cmd_init(c):
+    """Lancé par audio-hub-init.service (utilisateur audio) après WirePlumber."""
+    mid = None
+    for _ in range(60):
+        mid = node_id(c, c.master)
+        if mid is not None:
+            break
+        time.sleep(1)
+    if mid is None:
+        die("MASTER n'est pas apparu en 60 s")
+    subprocess.run(["wpctl", "set-default", str(mid)])
+    v = read_saved_volume(c)
+    if v is None:
+        v = float(c.g["master.initial-volume"])
+    v = max(0.0, min(v, c.max_volume))
+    subprocess.run(["wpctl", "set-volume", str(mid), "%.4f" % v])
+    log("MASTER [%s] par défaut, volume %.2f" % (mid, v))
+    # Gains des entrées (nœuds de lecture des boucles)
+    time.sleep(2)
+    for d in c.inputs:
+        if d.enabled and "volume" in d.opts:
+            nid = node_id(c, "hub.loop.%s.playback" % d.id)
+            if nid is not None:
+                subprocess.run(["wpctl", "set-volume", str(nid), d.opts["volume"]])
+
+
+# ----------------------------------------------------------------------------
+#  Knob USB
+# ----------------------------------------------------------------------------
+class Master:
+    def __init__(self, c):
+        self.c = c
+        self.id = None
+        self.dirty_since = None
+
+    def _wpctl(self, *args):
+        for attempt in (0, 1):
+            if self.id is None:
+                self.id = node_id(self.c, self.c.master)
+                if self.id is None:
+                    log("MASTER introuvable")
+                    return None
+            r = subprocess.run(["wpctl"] + [a.replace("@ID@", str(self.id)) for a in args],
+                               text=True, capture_output=True)
+            if r.returncode == 0:
+                return r.stdout
+            self.id = None      # nœud recréé (redémarrage PipeWire) : on le recherche
+        return None
+
+    def change(self, delta):
+        sign = "+" if delta > 0 else "-"
+        self._wpctl("set-volume", "-l", "%.3f" % self.c.max_volume, "@ID@", "%.4f%s" % (abs(delta), sign))
+        if delta > 0:
+            self._wpctl("set-mute", "@ID@", "0")
+        self.dirty_since = time.monotonic()
+
+    def toggle_mute(self):
+        self._wpctl("set-mute", "@ID@", "toggle")
+
+    def maybe_save(self):
+        if self.dirty_since and time.monotonic() - self.dirty_since > 3:
+            out = self._wpctl("get-volume", "@ID@") or ""
+            m = re.search(r"Volume:\s*([0-9.]+)", out)
+            if m:
+                save_volume(self.c, float(m.group(1)))
+            self.dirty_since = None
+
+
+def mopidy_rpc(c, method, **params):
+    data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request("http://127.0.0.1:%s/mopidy/rpc" % c.mopidy["http.port"],
+                                 data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=3) as r:
+        return json.loads(r.read()).get("result")
+
+
+def knob_candidates():
+    import evdev
+    from evdev import ecodes as e
+    found = []
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+            caps = d.capabilities()
+        except OSError:
+            continue
+        keys = caps.get(e.EV_KEY, [])
+        rels = caps.get(e.EV_REL, [])
+        score = 0
+        if e.KEY_VOLUMEUP in keys and e.KEY_VOLUMEDOWN in keys:
+            score += 2
+        if e.REL_DIAL in rels:
+            score += 1
+        if e.KEY_A in keys:          # un clavier complet : candidat de dernier recours
+            score -= 1
+        if score > 0:
+            found.append((score, path, d.name, d.phys))
+    found.sort(key=lambda t: -t[0])
+    return found
+
+
+def by_id_links():
+    links = {}
+    base = "/dev/input/by-id"
+    if os.path.isdir(base):
+        for n in os.listdir(base):
+            links[os.path.realpath(os.path.join(base, n))] = os.path.join(base, n)
+    return links
+
+
+def cmd_knob_list(c):
+    try:
+        cands = knob_candidates()
+    except ImportError:
+        die("python3-evdev manquant (sudo apt install python3-evdev)")
+    links = by_id_links()
+    if not cands:
+        print("Aucun périphérique avec touches de volume ou molette détecté.")
+    for score, path, name, phys in cands:
+        print("%s\n    nom : %s\n    chemin stable : %s" % (path, name, links.get(path, "(aucun lien by-id)")))
+    print("\nÀ reporter dans [knob] device = … (de préférence le chemin /dev/input/by-id/…)")
+
+
+def cmd_knob(c):
+    if not yes(c.knob["enabled"]):
+        log("knob désactivé dans la configuration")
+        return
+    import evdev
+    from evdev import ecodes as e
+    step = float(c.knob["step"])
+    press = c.knob["press"].strip().lower()
+    grab = yes(c.knob["grab"])
+    master = Master(c)
+    want = c.knob["device"].strip()
+    PRESS_KEYS = {e.KEY_PLAYPAUSE, e.KEY_PLAY, e.KEY_PAUSE, e.KEY_ENTER, e.BTN_LEFT, e.BTN_0}
+    while True:
+        path = None
+        if want.lower() == "auto":
+            cands = knob_candidates()
+            path = cands[0][1] if cands else None
+        elif os.path.exists(want):
+            path = want
+        if not path:
+            time.sleep(3)          # knob débranché : on attend qu'il revienne
+            continue
+        try:
+            dev = evdev.InputDevice(path)
+            if grab:
+                try:
+                    dev.grab()
+                except OSError:
+                    pass
+            log("knob : %s (%s)" % (dev.name, path))
+            while True:
+                r, _, _ = select.select([dev.fd], [], [], 1.0)
+                if not r:
+                    master.maybe_save()
+                    continue
+                for ev in dev.read():
+                    if ev.type == e.EV_KEY and ev.value in (1, 2):
+                        if ev.code == e.KEY_VOLUMEUP:
+                            master.change(+step)
+                        elif ev.code == e.KEY_VOLUMEDOWN:
+                            master.change(-step)
+                        elif ev.value == 1 and ev.code == e.KEY_MUTE:
+                            master.toggle_mute()
+                        elif ev.value == 1 and ev.code in PRESS_KEYS:
+                            if press == "mute":
+                                master.toggle_mute()
+                            elif press == "playpause":
+                                try:
+                                    st = mopidy_rpc(c, "core.playback.get_state")
+                                    mopidy_rpc(c, "core.playback.pause" if st == "playing"
+                                               else "core.playback.play")
+                                except Exception as ex:  # Mopidy absent : sans gravité
+                                    log("Mopidy injoignable : %s" % ex)
+                    elif ev.type == e.EV_REL and ev.code in (e.REL_DIAL, e.REL_WHEEL) and ev.value:
+                        master.change(step * (1 if ev.value > 0 else -1))
+        except OSError as ex:
+            log("knob déconnecté (%s), en attente…" % ex)
+            master.maybe_save()
+            time.sleep(1)
+
+
+def cmd_boot_config(c, path):
+    sys.stdout.write(boot_transform(open(path, encoding="utf-8").read(), c))
+
+
+# =============================================================================
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        head = open(__file__, encoding="utf-8").read().split("import configparser")[0]
+        print("\n".join(l[2:] for l in head.splitlines()[1:] if l.startswith("#") and "====" not in l))
+        return
+    cmd = args[0]
+    c = Config()
+    if cmd == "check":
+        cmd_check(c)
+    elif cmd == "generate":
+        if len(args) < 2:
+            die("usage : audio-hub generate DOSSIER")
+        cmd_generate(c, args[1])
+    elif cmd == "apply":
+        cmd_apply(c)
+    elif cmd == "list":
+        cmd_list(c)
+    elif cmd == "status":
+        cmd_status(c)
+    elif cmd == "init":
+        cmd_init(c)
+    elif cmd == "knob":
+        cmd_knob(c)
+    elif cmd == "knob-list":
+        cmd_knob_list(c)
+    elif cmd == "boot-config":
+        if len(args) < 2:
+            die("usage : audio-hub boot-config FICHIER")
+        cmd_boot_config(c, args[1])
+    else:
+        die("commande inconnue : %s (voir audio-hub help)" % cmd)
+
+
+if __name__ == "__main__":
+    main()

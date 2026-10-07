@@ -1,0 +1,15 @@
+# Unité utilisateur (hifi) : après le démarrage de PipeWire/WirePlumber,
+# met MASTER par défaut et restaure son volume.
+[Unit]
+Description=audio-hub : initialisation de MASTER
+Wants=pipewire.service wireplumber.service
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/audio-hub init
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target

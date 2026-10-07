@@ -1,0 +1,13 @@
+# Unité utilisateur (hifi) : bouton de volume USB -> volume de MASTER
+[Unit]
+Description=audio-hub : knob de volume USB
+Wants=pipewire.service wireplumber.service
+After=audio-hub-init.service
+
+[Service]
+ExecStart=/usr/local/bin/audio-hub knob
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

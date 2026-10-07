@@ -1,0 +1,35 @@
+# Intégration continue : à chaque push et pull request.
+# Pas de matériel audio ici : on valide la configuration et les fichiers générés.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ShellCheck + Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntaxe bash + ShellCheck
+        run: |
+          for f in install.sh tests/*.sh; do bash -n "$f"; done
+          shellcheck -S warning install.sh tests/*.sh
+      - name: Python (compilation + pyflakes)
+        run: |
+          python3 -m py_compile files/bin/audio-hub
+          pipx run pyflakes files/bin/audio-hub
+
+  config:
+    name: Configuration générée
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Outils PipeWire (spa-json-dump, si disponible)
+        run: sudo apt-get update && sudo apt-get install -y pipewire-bin || true
+      - run: bash tests/test-config.sh

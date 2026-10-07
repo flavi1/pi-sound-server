@@ -1,0 +1,11 @@
+# Unité utilisateur (hifi) : indexation de la bibliothèque locale Mopidy
+[Unit]
+Description=Mopidy : indexation de /media
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+# laisser le temps au disque d'être monté après la création du dossier
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/mopidy --config %h/.config/mopidy/mopidy.conf local scan

@@ -1,0 +1,13 @@
+# Unité utilisateur (hifi) : Mopidy joue dans le graphe PipeWire de hifi
+[Unit]
+Description=Mopidy (lecteur réseau)
+Wants=pipewire.service wireplumber.service network-online.target
+After=audio-hub-init.service
+
+[Service]
+ExecStart=/usr/bin/mopidy --config %h/.config/mopidy/mopidy.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
