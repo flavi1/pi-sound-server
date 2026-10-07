@@ -57,7 +57,8 @@ KNOB_DEFAULTS = {"enabled": "yes", "device": "auto", "step": "0.02", "press": "m
 BOOT_DEFAULTS = {"manage": "yes", "file": "auto", "overlay": "iqaudio-dacplus,unmute_amp",
                  "disable-onboard-audio": "yes", "disable-hdmi-audio": "yes"}
 MOPIDY_DEFAULTS = {"enabled": "yes", "http.port": "6680", "mpd.port": "6600",
-                   "media-dirs": "/media", "iris": "yes", "scan-interval-minutes": "60"}
+                   "media-dirs": "/media", "iris": "yes", "scan-interval-minutes": "60",
+                   "extra-codecs": "no"}
 
 
 def die(msg):

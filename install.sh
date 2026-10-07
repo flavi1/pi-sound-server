@@ -24,7 +24,9 @@ F="$HERE/files"
 CONF_DIR=/etc/pi-sound-server
 CONF="$CONF_DIR/audio-hub.conf"
 export DEBIAN_FRONTEND=noninteractive
-APT=(apt-get -o DPkg::Lock::Timeout=900 -y)
+# --no-install-recommends : seulement les dépendances strictes (carte SD de petite
+# taille ; les « recommandés » tirent des centaines de Mo inutiles ici).
+APT=(apt-get -o DPkg::Lock::Timeout=900 -o APT::Install-Recommends=false -y)
 # apt_run ARGS… : apt-get qui patiente si apt est déjà occupé (mises à jour
 # automatiques, autre installation). DPkg::Lock::Timeout ne couvre que le verrou
 # de dpkg, pas ceux du cache et des listes : on réessaie tant qu'un autre apt tourne.
@@ -84,15 +86,31 @@ AUSER="$(ini global user)"; AUSER="${AUSER:-hifi}"
 HP="$(ini mopidy http.port)"; HP="${HP:-6680}"
 MP="$(ini mopidy mpd.port)";  MP="${MP:-6600}"
 IRIS="$(ini mopidy iris)"
+CODECS="$(ini mopidy extra-codecs)"; CODECS="${CODECS:-no}"
 
 # --- Paquets ------------------------------------------------------------------
 log "Paquets PipeWire / Mopidy"
+# Espace libre : PipeWire + Mopidy ≈ 250 Mo, + ≈ 300 Mo si codecs supplémentaires
+NEED_MB=400
+[[ "${CODECS,,}" =~ ^(yes|true|1|on|oui)$ ]] && NEED_MB=750
+FREE_MB="$(df -Pm / | awk 'NR==2 {print $4}')"
+if (( FREE_MB < NEED_MB )); then
+    warn "Espace libre insuffisant sur / : ${FREE_MB} Mo, il en faut environ ${NEED_MB}."
+    warn "Libérez de la place (sudo apt-get clean) ou utilisez une carte plus grande."
+    exit 1
+fi
+
 apt_run update
+# Audio uniquement : FLAC, MP3, OGG/Vorbis, Opus, WAV, AIFF (plugins base + good).
+# Pas de plugins « bad » / « ugly » : codecs vidéo, rendu graphique, X11…
 apt_run install pipewire pipewire-bin wireplumber pipewire-alsa dbus-user-session \
     alsa-utils python3 python3-evdev \
-    gstreamer1.0-pipewire gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+    gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     mopidy
+if [[ "${CODECS,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
+    log "Codecs supplémentaires (AAC, M4A, ALAC, WMA… via ffmpeg) : ≈ 300 Mo"
+    apt_run install gstreamer1.0-libav
+fi
 for p in mopidy-local mopidy-mpd; do
     apt_run install "$p" || warn "paquet $p indisponible dans les dépôts (voir README : installation pip)"
 done
@@ -161,6 +179,7 @@ if ! aplay -l 2>/dev/null | grep -qiE 'iqaudio|digiamp'; then
     fi
 fi
 
+apt-get clean
 IP="$(hostname -I | awk '{print $1}')"
 log "Serveur de son prêt"
 cat <<EOF

@@ -160,6 +160,7 @@ sudo audio-hub status     # MASTER, entrées/sorties présentes, liens actifs
 | `[input.<id>]` | mêmes clés + `volume` | gain de l'entrée dans MASTER (0..1) |
 | `[boot]` | `manage`, `file`, `overlay`, `disable-onboard-audio`, `disable-hdmi-audio` | config.txt (voir plus haut) |
 | `[mopidy]` | `http.port`, `mpd.port`, `media-dirs`, `iris`, `scan-interval-minutes` | |
+| | `extra-codecs` | `no` : FLAC, MP3, OGG, Opus, WAV, AIFF. `yes` : + AAC/M4A/ALAC/WMA (ffmpeg, ≈ 300 Mo), puis relancer `install.sh` |
 
 Ajouter un appareil = ajouter une section `[output.xxx]` ou `[input.xxx]`.
 
