@@ -23,6 +23,8 @@
 #  Usage interne (services systemd de l'utilisateur audio) :
 #  audio-hub init              attend MASTER, le met par défaut, restaure le volume
 #  audio-hub knob              démon du bouton de volume USB
+#  audio-hub links             démon : relie chaque entrée à MASTER seulement
+#                              quand elle fournit réellement du son
 # =============================================================================
 import configparser
 import json
@@ -275,9 +277,11 @@ def gen_pipewire(c):
                 "playback.props": {
                     "node.name": base + ".playback",
                     "node.description": "%s -> %s" % (d.description, master),
-                    "target.object": master,
-                    "node.dont-fallback": True,
-                    "node.linger": True,
+                    # Pas de lien automatique vers MASTER : tant que l'entrée n'a
+                    # jamais fourni de données, la boucle peut émettre des valeurs
+                    # invalides qui rendent tout MASTER muet. « audio-hub links »
+                    # ne crée le lien que lorsque la capture tourne vraiment.
+                    "node.autoconnect": False,
                     "node.dont-move": True,
                     "resample.quality": int(c.g["resample.quality"]),
                 },
@@ -667,7 +671,7 @@ def cmd_apply(c):
     knob = yes(c.knob["enabled"])
     mop = yes(c.mopidy["enabled"])
     systemctl_user(c, "enable", "pipewire.socket", "pipewire.service", "wireplumber.service",
-                   "audio-hub-init.service")
+                   "audio-hub-init.service", "audio-hub-links.service")
     for unit, on in (("audio-hub-knob.service", knob), ("mopidy.service", mop),
                      ("mopidy-scan.timer", mop), ("mopidy-scan.path", mop)):
         if on:
@@ -678,7 +682,7 @@ def cmd_apply(c):
     r = systemctl_user(c, "restart", "pipewire.service", "wireplumber.service")
     if r.returncode != 0:
         die("redémarrage PipeWire impossible :\n" + r.stderr)
-    systemctl_user(c, "restart", "audio-hub-init.service")
+    systemctl_user(c, "restart", "audio-hub-init.service", "audio-hub-links.service")
     if knob:
         systemctl_user(c, "restart", "audio-hub-knob.service")
     if mop:
@@ -1071,6 +1075,80 @@ def cmd_volume(c, args):
     print(fmt_volume(v or 0.0, muted))
 
 
+def pw_graph(c):
+    """(nœuds par nom, ports par id, liens) depuis pw-dump."""
+    r = as_user(c, ["pw-dump"])
+    if r.returncode != 0:
+        return None
+    try:
+        objs = json.loads(r.stdout)
+    except ValueError:
+        return None
+    nodes, ports, links = {}, {}, []
+    for o in objs:
+        t = o.get("type", "")
+        info = o.get("info") or {}
+        props = info.get("props") or {}
+        if t == "PipeWire:Interface:Node":
+            nodes[props.get("node.name")] = {"id": o["id"], "state": info.get("state")}
+        elif t == "PipeWire:Interface:Port":
+            ports[o["id"]] = (props.get("node.id"), props.get("port.name"), info.get("direction"))
+        elif t == "PipeWire:Interface:Link":
+            links.append((info.get("output-node-id"), info.get("output-port-id"),
+                          info.get("input-node-id"), info.get("input-port-id")))
+    return nodes, ports, links
+
+
+def links_step(c, verbose=False):
+    """Un passage : relie / délie chaque boucle d'entrée selon l'état de sa capture."""
+    g = pw_graph(c)
+    if g is None:
+        return
+    nodes, ports, links = g
+    master = nodes.get(c.master)
+    if master is None:
+        return
+    for d in c.inputs:
+        if not d.enabled:
+            continue
+        play = nodes.get("hub.loop.%s.playback" % d.id)
+        cap = nodes.get("hub.loop.%s.capture" % d.id)
+        if play is None:
+            continue
+        # « running » : la capture reçoit réellement des données de l'appareil
+        active = (cap is not None and cap["state"] == "running"
+                  and ("hub.in.%s" % d.id) in nodes)
+        out_ports = {name: pid for pid, (nid, name, dr) in ports.items()
+                     if nid == play["id"] and dr == "output"}
+        linked = [(op, ip) for (on, op, inn, ip) in links
+                  if on == play["id"] and inn == master["id"]]
+        if active and not linked:
+            for name in sorted(out_ports):
+                ch = name.split("_", 1)[-1]
+                as_user(c, ["pw-link", "%s:%s" % ("hub.loop.%s.playback" % d.id, name),
+                            "%s:playback_%s" % (c.master, ch)])
+            log("entrée %s : reliée à %s" % (d.id, c.master))
+        elif not active and linked:
+            for (op, ip) in linked:
+                as_user(c, ["pw-link", "-d", str(op), str(ip)])
+            log("entrée %s : déliée de %s (appareil absent ou inactif)" % (d.id, c.master))
+        elif verbose:
+            log("entrée %s : %s" % (d.id, "reliée" if linked else "absente"))
+
+
+def cmd_links(c, args):
+    if args and args[0] == "once":
+        links_step(c, verbose=True)
+        return
+    log("audio-hub links : surveillance des entrées")
+    while True:
+        try:
+            links_step(c)
+        except Exception as ex:          # PipeWire en redémarrage, etc.
+            log("links : %s" % ex)
+        time.sleep(1.5)
+
+
 def cmd_boot_config(c, path):
     sys.stdout.write(boot_transform(open(path, encoding="utf-8").read(), c))
 
@@ -1100,6 +1178,8 @@ def main():
         cmd_init(c)
     elif cmd == "knob":
         cmd_knob(c)
+    elif cmd == "links":
+        cmd_links(c, args[1:])
     elif cmd == "volume":
         cmd_volume(c, args[1:])
     elif cmd == "diag":

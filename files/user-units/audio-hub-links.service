@@ -1,0 +1,16 @@
+# Unité utilisateur (hifi) : relie chaque entrée (platine, S/PDIF…) à MASTER
+# uniquement quand l'appareil fournit réellement du son. Une entrée absente ne
+# doit jamais être reliée : sa boucle pourrait rendre tout MASTER muet.
+[Unit]
+Description=audio-hub : liens des entrées vers MASTER
+Wants=pipewire.service wireplumber.service
+After=audio-hub-init.service
+
+[Service]
+ExecStart=/usr/local/bin/audio-hub links
+Restart=always
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=default.target

@@ -50,8 +50,12 @@ apparaît » ; c'est ce que fait la configuration générée :
 2. **Sorties** : MASTER crée une copie vers chaque nœud `hub.out.*` dès qu'il apparaît,
    et la supprime quand il disparaît.
 3. **Entrées** : chaque boucle cible son `hub.in.*` avec `node.dont-fallback` +
-   `node.linger` : appareil absent → la boucle attend en silence (sans jamais se
-   rabattre sur une autre entrée) ; appareil revenu → raccordée automatiquement.
+   `node.linger` : appareil absent → la boucle attend (sans jamais se rabattre sur une
+   autre entrée). Sa sortie n'est **reliée à MASTER que lorsque l'appareil fournit
+   réellement du son** (service `audio-hub-links`), et déliée dès qu'il disparaît : une
+   boucle dont l'appareil n'a jamais été vu depuis le démarrage peut émettre des
+   valeurs invalides qui rendraient **tout MASTER muet** (défaut constaté : silence
+   après chaque démarrage tant que la platine n'avait pas été allumée).
 4. Les appareils ne sont jamais mis en veille (pas de « clac » sur l'ampli).
 
 Allumer/éteindre le DAC ou la platine n'importe quand est donc sans conséquence pour le
@@ -291,6 +295,7 @@ Autres points :
 |---|---|
 | `MASTER ABSENT` | `sudo journalctl -b _SYSTEMD_USER_UNIT=pipewire.service` : erreur de syntaxe ou module manquant |
 | Doute général | `sudo audio-hub diag` : rapport complet dans `/tmp/audio-hub-diag.txt` |
+| Silence partout alors que tout est « running » | une entrée absente reliée à MASTER : `systemctl --user -M hifi@ status audio-hub-links`, `sudo audio-hub links once` |
 | Appareil `absente` alors qu'il est branché | ses `match.*` ne correspondent pas : `sudo audio-hub list` |
 | Craquements | `clock.quantum = 2048`, puis `period-size = 1024` / `headroom = 1024` sur l'appareil USB ; baisser `resample.quality` si le CPU sature (`top`) |
 | Son robotique / haché sur le S/PDIF | fréquence du PC ≠ `rate` de `[input.spdif]` : voir la section ci-dessus |
