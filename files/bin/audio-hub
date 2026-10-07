@@ -832,6 +832,9 @@ def mopidy_rpc(c, method, **params):
 
 
 def knob_candidates():
+    """Périphériques d'entrée USB capables de piloter le volume, du meilleur au moins bon.
+    Les entrées non USB sont ignorées : la Pi expose par exemple « vc4-hdmi-0/1 »
+    (HDMI-CEC), qui déclarent aussi des touches de volume."""
     import evdev
     from evdev import ecodes as e
     found = []
@@ -840,6 +843,8 @@ def knob_candidates():
             d = evdev.InputDevice(path)
             caps = d.capabilities()
         except OSError:
+            continue
+        if "usb" not in (d.phys or "").lower():
             continue
         keys = caps.get(e.EV_KEY, [])
         rels = caps.get(e.EV_REL, [])
@@ -852,6 +857,7 @@ def knob_candidates():
             score -= 1
         if score > 0:
             found.append((score, path, d.name, d.phys))
+        d.close()
     found.sort(key=lambda t: -t[0])
     return found
 
@@ -878,6 +884,19 @@ def cmd_knob_list(c):
     print("\nÀ reporter dans [knob] device = … (de préférence le chemin /dev/input/by-id/…)")
 
 
+def knob_wanted_paths(c):
+    """Chemins à écouter : « auto » = tous les candidats USB ; sinon la liste
+    (séparée par des virgules) des chemins configurés qui existent."""
+    want = c.knob["device"].strip()
+    if want.lower() == "auto":
+        return [t[1] for t in knob_candidates() if t[0] >= 2]
+    paths = []
+    for w in (x.strip() for x in want.split(",")):
+        if w and os.path.exists(w):
+            paths.append(os.path.realpath(w))
+    return paths
+
+
 def cmd_knob(c):
     if not yes(c.knob["enabled"]):
         log("knob désactivé dans la configuration")
@@ -888,55 +907,80 @@ def cmd_knob(c):
     press = c.knob["press"].strip().lower()
     grab = yes(c.knob["grab"])
     master = Master(c)
-    want = c.knob["device"].strip()
     PRESS_KEYS = {e.KEY_PLAYPAUSE, e.KEY_PLAY, e.KEY_PAUSE, e.KEY_ENTER, e.BTN_LEFT, e.BTN_0}
+    devs = {}                  # chemin -> InputDevice
+    last_scan = 0.0
+
+    def drop(path, why):
+        d = devs.pop(path, None)
+        if d is not None:
+            log("knob retiré : %s (%s)" % (path, why))
+            try:
+                d.close()
+            except OSError:
+                pass
+
     while True:
-        path = None
-        if want.lower() == "auto":
-            cands = knob_candidates()
-            path = cands[0][1] if cands else None
-        elif os.path.exists(want):
-            path = want
-        if not path:
-            time.sleep(3)          # knob débranché : on attend qu'il revienne
-            continue
-        try:
-            dev = evdev.InputDevice(path)
-            if grab:
+        # (Re)découverte toutes les 3 s : branchement / débranchement à chaud
+        if time.monotonic() - last_scan > 3:
+            last_scan = time.monotonic()
+            wanted = set(knob_wanted_paths(c))
+            for path in list(devs):
+                if path not in wanted:
+                    drop(path, "disparu")
+            for path in wanted - set(devs):
                 try:
-                    dev.grab()
+                    d = evdev.InputDevice(path)
+                    if grab:
+                        try:
+                            d.grab()
+                        except OSError:
+                            pass
+                    devs[path] = d
+                    log("knob : %s (%s)" % (d.name, path))
                 except OSError:
                     pass
-            log("knob : %s (%s)" % (dev.name, path))
-            while True:
-                r, _, _ = select.select([dev.fd], [], [], 1.0)
-                if not r:
-                    master.maybe_save()
-                    continue
-                for ev in dev.read():
-                    if ev.type == e.EV_KEY and ev.value in (1, 2):
-                        if ev.code == e.KEY_VOLUMEUP:
-                            master.change(+step)
-                        elif ev.code == e.KEY_VOLUMEDOWN:
-                            master.change(-step)
-                        elif ev.value == 1 and ev.code == e.KEY_MUTE:
-                            master.toggle_mute()
-                        elif ev.value == 1 and ev.code in PRESS_KEYS:
-                            if press == "mute":
-                                master.toggle_mute()
-                            elif press == "playpause":
-                                try:
-                                    st = mopidy_rpc(c, "core.playback.get_state")
-                                    mopidy_rpc(c, "core.playback.pause" if st == "playing"
-                                               else "core.playback.play")
-                                except Exception as ex:  # Mopidy absent : sans gravité
-                                    log("Mopidy injoignable : %s" % ex)
-                    elif ev.type == e.EV_REL and ev.code in (e.REL_DIAL, e.REL_WHEEL) and ev.value:
-                        master.change(step * (1 if ev.value > 0 else -1))
-        except OSError as ex:
-            log("knob déconnecté (%s), en attente…" % ex)
+        if not devs:
             master.maybe_save()
             time.sleep(1)
+            continue
+        try:
+            ready, _, _ = select.select([d.fd for d in devs.values()], [], [], 1.0)
+        except (OSError, ValueError):
+            for path in list(devs):
+                drop(path, "erreur")
+            continue
+        if not ready:
+            master.maybe_save()
+            continue
+        for path, d in list(devs.items()):
+            if d.fd not in ready:
+                continue
+            try:
+                events = list(d.read())
+            except OSError as ex:
+                drop(path, ex)
+                continue
+            for ev in events:
+                if ev.type == e.EV_KEY and ev.value in (1, 2):
+                    if ev.code == e.KEY_VOLUMEUP:
+                        master.change(+step)
+                    elif ev.code == e.KEY_VOLUMEDOWN:
+                        master.change(-step)
+                    elif ev.value == 1 and ev.code == e.KEY_MUTE:
+                        master.toggle_mute()
+                    elif ev.value == 1 and ev.code in PRESS_KEYS:
+                        if press == "mute":
+                            master.toggle_mute()
+                        elif press == "playpause":
+                            try:
+                                st = mopidy_rpc(c, "core.playback.get_state")
+                                mopidy_rpc(c, "core.playback.pause" if st == "playing"
+                                           else "core.playback.play")
+                            except Exception as ex:  # Mopidy absent : sans gravité
+                                log("Mopidy injoignable : %s" % ex)
+                elif ev.type == e.EV_REL and ev.code in (e.REL_DIAL, e.REL_WHEEL) and ev.value:
+                    master.change(step * (1 if ev.value > 0 else -1))
 
 
 def cmd_boot_config(c, path):

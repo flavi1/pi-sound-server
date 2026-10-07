@@ -69,10 +69,10 @@ sec "Configuration (audio-hub.conf, hors commentaires)"
 grep -vE '^\s*(#|$)' "$CONF"
 
 sec "Journal PipeWire / WirePlumber (démarrage courant)"
-journalctl _UID="$AUID" --user-unit=pipewire --user-unit=wireplumber -b --no-pager 2>&1 | tail -n 60
+journalctl -b --no-pager _SYSTEMD_USER_UNIT=pipewire.service + _SYSTEMD_USER_UNIT=wireplumber.service 2>&1 | tail -n 60
 
 sec "Journal knob / Mopidy"
-journalctl _UID="$AUID" --user-unit=audio-hub-knob --user-unit=audio-hub-init --user-unit=mopidy -b --no-pager 2>&1 | tail -n 50
+journalctl -b --no-pager _SYSTEMD_USER_UNIT=audio-hub-knob.service + _SYSTEMD_USER_UNIT=audio-hub-init.service + _SYSTEMD_USER_UNIT=mopidy.service 2>&1 | tail -n 50
 
 sec "Noyau (USB, son)"
 dmesg 2>/dev/null | grep -iE 'usb|snd|audio|iqaudio|pcm512|xrun|urb' | tail -n 50
