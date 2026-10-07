@@ -37,3 +37,5 @@ jobs:
         run: python3 tests/test-knob.py
       - name: "Liens des entrées vers MASTER (faux graphe)"
         run: python3 tests/test-links.py
+      - name: "Bluetooth : agent de jumelage par code PIN (faux D-Bus)"
+        run: python3 tests/test-bluetooth.py

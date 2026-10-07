@@ -1,0 +1,21 @@
+# Service système : la Pi en enceinte Bluetooth (section [bluetooth] de
+# /etc/pi-sound-server/audio-hub.conf). Rend la Pi visible et jumelable, impose le
+# code PIN de la configuration, marque les appareils jumelés de confiance.
+# Activé / désactivé / redémarré par « sudo audio-hub apply ».
+[Unit]
+Description=audio-hub : enceinte Bluetooth (jumelage par code PIN)
+Requires=bluetooth.service
+After=bluetooth.service
+PartOf=bluetooth.service
+
+[Service]
+ExecStart=/usr/local/bin/audio-hub bluetooth
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

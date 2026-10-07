@@ -88,6 +88,7 @@ HP="$(ini mopidy http.port)"; HP="${HP:-6680}"
 MP="$(ini mopidy mpd.port)";  MP="${MP:-6600}"
 IRIS="$(ini mopidy iris)"
 CODECS="$(ini mopidy extra-codecs)"; CODECS="${CODECS:-no}"
+BT="$(ini bluetooth enabled)"; BT="${BT:-no}"
 
 # --- Paquets ------------------------------------------------------------------
 log "Paquets PipeWire / Mopidy"
@@ -112,6 +113,10 @@ if [[ "${CODECS,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
     log "Codecs supplémentaires (AAC, M4A, ALAC, WMA… via ffmpeg) : ≈ 300 Mo"
     apt_run install gstreamer1.0-libav
 fi
+if [[ "${BT,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
+    log "Bluetooth (BlueZ, codecs Bluetooth de PipeWire, agent de jumelage)"
+    apt_run install bluez libspa-0.2-bluetooth python3-dbus python3-gi
+fi
 for p in mopidy-local mopidy-mpd; do
     apt_run install "$p" || warn "paquet $p indisponible dans les dépôts (voir README : installation pip)"
 done
@@ -121,7 +126,7 @@ log "Utilisateur « $AUSER »"
 if ! id -u "$AUSER" >/dev/null 2>&1; then
     useradd --create-home --shell /usr/sbin/nologin --comment "pi-sound-server" "$AUSER"
 fi
-for g in audio input pipewire video; do
+for g in audio input pipewire video bluetooth; do
     getent group "$g" >/dev/null && usermod -aG "$g" "$AUSER"
 done
 # Le gestionnaire systemd de l'utilisateur démarre au boot, sans connexion
@@ -150,6 +155,10 @@ install -d -o "$AUSER" -g "$AUSER" "$UHOME/.config" "$UHOME/.config/systemd" "$U
 for u in "$F"/user-units/*; do
     install -m 644 -o "$AUSER" -g "$AUSER" "$u" "$UHOME/.config/systemd/user/"
 done
+
+# --- Service système Bluetooth (activé ou non par « audio-hub apply ») -------------
+install -m 644 "$F/system-units/audio-hub-bluetooth.service" /etc/systemd/system/
+systemctl daemon-reload
 
 # --- Pare-feu (seulement si un pare-feu pi-server est en place) ----------------------
 if [[ -f /etc/nftables.d/00-lan.nft ]] && grep -q 'nftables.d/\[1-9\]' /etc/nftables.conf 2>/dev/null; then

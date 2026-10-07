@@ -26,8 +26,14 @@
 #  audio-hub links             démon : relie chaque entrée à MASTER seulement
 #                              quand elle fournit réellement du son, et rallume
 #                              les appareils USB revenus sur le profil « off »
+#
+#  Service système (root) :
+#  audio-hub bluetooth         enceinte Bluetooth : visible, jumelage par code PIN
+#                              obligatoire (section [bluetooth]), appareils jumelés
+#                              marqués de confiance (reconnexion automatique)
 # =============================================================================
 import configparser
+import glob
 import json
 import math
 import os
@@ -35,6 +41,7 @@ import pwd
 import re
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -67,6 +74,11 @@ BOOT_DEFAULTS = {"manage": "yes", "file": "auto", "overlay": "iqaudio-dacplus,un
 MOPIDY_DEFAULTS = {"enabled": "yes", "http.port": "6680", "mpd.port": "6600",
                    "media-dirs": "/media", "iris": "yes", "scan-interval-minutes": "60",
                    "extra-codecs": "no"}
+# Bluetooth désactivé si la section est absente : ouvrir une interface radio doit
+# être un choix explicite (le modèle audio-hub.conf l'active).
+BT_DEFAULTS = {"enabled": "no", "name": "auto", "pin": "1234", "discoverable": "yes"}
+BT_UNIT = "audio-hub-bluetooth.service"
+BT_CLASS = 0x0414            # classe d'appareil : Audio/Vidéo, haut-parleur
 
 
 def die(msg):
@@ -145,6 +157,7 @@ class Config:
         self.knob = dict(KNOB_DEFAULTS)
         self.mopidy = dict(MOPIDY_DEFAULTS)
         self.boot = dict(BOOT_DEFAULTS)
+        self.bt = dict(BT_DEFAULTS)
         self.outputs, self.inputs = [], []
         for name in cp.sections():
             sec = dict(cp.items(name))
@@ -156,6 +169,8 @@ class Config:
                 self._merge(self.mopidy, sec, name)
             elif name == "boot":
                 self._merge(self.boot, sec, name)
+            elif name == "bluetooth":
+                self._merge(self.bt, sec, name)
             elif name.startswith("output.") or name.startswith("input."):
                 kind, ident = name.split(".", 1)
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", ident):
@@ -167,6 +182,10 @@ class Config:
                   "resample.quality"):
             if not self.g[k].isdigit():
                 die("[global] %s doit être un entier" % k)
+        if not re.fullmatch(r"[0-9]{4,16}", self.bt["pin"]):
+            die("[bluetooth] pin doit compter 4 à 16 chiffres (ex. 1234)")
+        if not self.bt["name"]:
+            die("[bluetooth] name ne peut pas être vide (auto = nom de la machine)")
         self.allowed_rates = [int(x) for x in re.split(r"[\s,]+", self.g["clock.allowed-rates"].strip()) if x]
         if int(self.g["clock.rate"]) not in self.allowed_rates:
             self.allowed_rates.insert(0, int(self.g["clock.rate"]))
@@ -190,6 +209,15 @@ class Config:
     @property
     def master(self):
         return self.g["master.name"]
+
+    @property
+    def bt_enabled(self):
+        return yes(self.bt["enabled"])
+
+    @property
+    def bt_name(self):
+        n = self.bt["name"]
+        return socket.gethostname() if n.lower() == "auto" else n
 
     @property
     def max_volume(self):
@@ -357,6 +385,33 @@ def gen_wireplumber(c):
     return GEN_HEADER % c.path + spa_top(doc)
 
 
+def gen_wireplumber_bt(c):
+    """Bluetooth : la Pi est une enceinte (A2DP « sink »). Aucune fréquence ni aucun
+    codec imposé : chaque téléphone négocie ce qu'il sait faire (SBC, AAC, aptX,
+    LDAC…), PipeWire rééchantillonne vers MASTER. Le flux d'un téléphone est relié à
+    la sortie par défaut, c'est-à-dire MASTER."""
+    if not c.bt_enabled:
+        doc = {"wireplumber.profiles": {"main": {"monitor.bluez": "disabled"}}}
+        return GEN_HEADER % c.path + spa_top(doc)
+    doc = {
+        # Pas de session graphique (logind « seat ») : sans cela, WirePlumber
+        # n'active le Bluetooth que pour un utilisateur connecté à l'écran.
+        "wireplumber.profiles": {"main": {"monitor.bluez.seat-monitoring": "disabled"}},
+        "monitor.bluez.properties": {
+            "bluez5.roles": ["a2dp_sink"],          # recevoir de la musique, rien d'autre
+            "bluez5.hfphsp-backend": "none",        # pas de profil téléphone / micro
+        },
+        "monitor.bluez.rules": [{
+            "matches": [{"node.name": "~bluez_input.*"}],
+            "actions": {"update-props": {
+                "priority.driver": 100,              # ne pilote jamais l'horloge
+                "session.suspend-timeout-seconds": 0,
+            }},
+        }],
+    }
+    return GEN_HEADER % c.path + spa_top(doc)
+
+
 def gen_mopidy(c):
     m = c.mopidy
     dirs = [x.strip() for x in m["media-dirs"].split(",") if x.strip()]
@@ -446,6 +501,7 @@ def boot_transform(text, c):
     """Renvoie le nouveau config.txt. Toutes les modifications sont réversibles :
     - bloc « pi-sound-server » (overlay du HAT) remplacé à chaque passage ;
     - dtparam=audio=on commenté avec un préfixe reconnaissable ;
+    - dtoverlay=disable-bt commenté de même quand le Bluetooth est activé ;
     - paramètre « noaudio » ajouté/retiré sur la ligne dtoverlay=vc4-kms-v3d."""
     lines = text.splitlines()
     out, inside = [], False
@@ -463,14 +519,20 @@ def boot_transform(text, c):
     manage = yes(c.boot["manage"])
     off_onboard = manage and yes(c.boot["disable-onboard-audio"])
     off_hdmi = manage and yes(c.boot["disable-hdmi-audio"])
+    bt_on = manage and c.bt_enabled
+    bt_re = re.compile(r"^\s*dtoverlay=(?:pi3-)?disable-bt\s*(?:#.*)?$")
     res = []
     for l in out:
-        # 2) audio intégré (jack 3,5 mm)
+        # 2) audio intégré (jack 3,5 mm) et Bluetooth : lignes commentées par nous
         if l.startswith(BOOT_OFF):
             orig = l[len(BOOT_OFF):]
-            res.append(BOOT_OFF + orig if off_onboard else orig)
+            keep_off = bt_on if bt_re.match(orig) else off_onboard
+            res.append(BOOT_OFF + orig if keep_off else orig)
             continue
         if re.match(r"^\s*dtparam=audio=on\s*$", l) and off_onboard:
+            res.append(BOOT_OFF + l)
+            continue
+        if bt_re.match(l) and bt_on:
             res.append(BOOT_OFF + l)
             continue
         # 3) audio HDMI : paramètre noaudio de l'overlay vidéo KMS
@@ -517,7 +579,7 @@ def apply_boot(c):
     os.sync()
     open("/var/run/reboot-required", "a").close()
     log("  %s mis à jour (sauvegarde : %s)" % (path, bak))
-    log("  ** REDÉMARRAGE NÉCESSAIRE pour le HAT / l'audio intégré : sudo reboot **")
+    log("  ** REDÉMARRAGE NÉCESSAIRE (HAT, audio intégré ou Bluetooth) : sudo reboot **")
     return True
 
 
@@ -543,6 +605,7 @@ def generated_files(c):
         ".config/pipewire/pipewire.conf.d/50-audio-hub.conf": gen_pipewire(c),
         ".config/pipewire/client.conf.d/50-audio-hub.conf": gen_client(c),
         ".config/wireplumber/wireplumber.conf.d/50-audio-hub.conf": gen_wireplumber(c),
+        ".config/wireplumber/wireplumber.conf.d/51-audio-hub-bluetooth.conf": gen_wireplumber_bt(c),
         ".config/mopidy/mopidy.conf": gen_mopidy(c),
         ".config/systemd/user/mopidy-scan.timer": gen_scan_timer(c),
         ".config/systemd/user/mopidy-scan.path": gen_scan_path(c),
@@ -642,6 +705,11 @@ def cmd_check(c):
         print("  entrée %-12s -> %-22s %s %s" % (d.id, d.node_name, "" if d.enabled else "[désactivée]", d.match))
     print("  knob         : %s (%s)" % ("actif" if yes(c.knob["enabled"]) else "inactif", c.knob["device"]))
     print("  mopidy       : %s" % ("actif" if yes(c.mopidy["enabled"]) else "inactif"))
+    if c.bt_enabled:
+        print("  bluetooth    : actif, nom « %s », code PIN %s, %s" % (
+            c.bt_name, c.bt["pin"], "visible" if yes(c.bt["discoverable"]) else "invisible"))
+    else:
+        print("  bluetooth    : inactif")
 
 
 def cmd_generate(c, outdir):
@@ -651,6 +719,37 @@ def cmd_generate(c, outdir):
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
         print("écrit", p)
+
+
+def apply_bluetooth(c):
+    """Service système audio-hub-bluetooth (root) : activé / désactivé selon la config,
+    redémarré pour relire le code PIN et le nom."""
+    legacy = os.path.join(c.home, ".config/wireplumber/wireplumber.conf.d/60-bluetooth.conf")
+    if os.path.exists(legacy):
+        log("  ATTENTION : %s (réglage manuel) fait doublon : supprimez-le" % legacy)
+    if not os.path.exists("/etc/systemd/system/" + BT_UNIT):
+        log("  service %s absent : relancez sudo bash /opt/pi-sound-server/install.sh" % BT_UNIT)
+        return
+
+    def sc(*a):
+        return subprocess.run(["systemctl"] + list(a), text=True, capture_output=True)
+
+    if not c.bt_enabled:
+        sc("disable", "--now", BT_UNIT)
+        sc("disable", "--now", "bluetooth.service")
+        log("  Bluetooth désactivé")
+        return
+    if not shutil.which("btmgmt"):
+        log("  BlueZ absent : relancez sudo bash /opt/pi-sound-server/install.sh")
+        return
+    sc("daemon-reload")
+    sc("enable", "--now", "bluetooth.service")
+    sc("enable", BT_UNIT)
+    r = sc("restart", BT_UNIT)
+    if r.returncode != 0:
+        log("  %s : échec du démarrage (journalctl -u %s)" % (BT_UNIT, BT_UNIT))
+    else:
+        log("  Bluetooth : « %s », code PIN %s" % (c.bt_name, c.bt["pin"]))
 
 
 def cmd_apply(c):
@@ -689,6 +788,8 @@ def cmd_apply(c):
     if mop:
         systemctl_user(c, "restart", "mopidy.service")
         systemctl_user(c, "restart", "mopidy-scan.timer", "mopidy-scan.path")
+    log("Bluetooth :")
+    apply_bluetooth(c)
     time.sleep(2)
     cmd_status(c)
 
@@ -744,9 +845,22 @@ def cmd_status(c):
             shown = True
     if not shown:
         print("  (aucun)")
+    if c.bt_enabled:
+        print("\n== BLUETOOTH ==")
+        phones = [(nid, p, st) for nid, p, st in nodes
+                  if str(p.get("node.name", "")).startswith("bluez_")]
+        for nid, p, st in phones:
+            print("  [%s] %s  état=%s  codec=%s  %s Hz" % (
+                nid, p.get("node.description", "?"), st, p.get("api.bluez5.codec", "?"),
+                p.get("audio.rate", "?")))
+        if not phones:
+            print("  aucun téléphone connecté (nom « %s », code PIN %s)" % (c.bt_name, c.bt["pin"]))
     for unit in ("audio-hub-knob.service", "mopidy.service"):
         r = systemctl_user(c, "is-active", unit)
         print("\n%s : %s" % (unit, (r.stdout or "").strip()), end="")
+    if c.bt_enabled:
+        r = subprocess.run(["systemctl", "is-active", BT_UNIT], text=True, capture_output=True)
+        print("\n%s : %s" % (BT_UNIT, (r.stdout or "").strip()), end="")
     print()
 
 
@@ -1202,6 +1316,238 @@ def cmd_links(c, args):
         time.sleep(1.5)
 
 
+# =============================================================================
+#  Bluetooth : agent de jumelage BlueZ (service système, root)
+# =============================================================================
+#  Un téléphone moderne jumelle par défaut SANS code (« Secure Simple Pairing » :
+#  simple confirmation). Pour qu'il DEMANDE un code, le contrôleur de la Pi passe
+#  en jumelage « classique » par code PIN (SSP désactivé) ; l'agent ci-dessous
+#  répond avec le code de la configuration. Un téléphone qui saisit un autre code
+#  échoue. Toute demande de jumelage sans code est refusée, même si le SSP se
+#  trouvait réactivé (redémarrage de bluetoothd) : jamais d'appairage sans PIN.
+AGENT_PATH = "/org/pisoundserver/bluetooth/agent"
+
+
+def mgmt_info(text):
+    """Sortie de « btmgmt info » -> {"settings": {...}, "class": int | None}."""
+    out = {"settings": set(), "class": None}
+    for l in text.splitlines():
+        l = l.strip()
+        if l.startswith("current settings:"):
+            out["settings"] = set(l.split(":", 1)[1].split())
+        m = re.search(r"\bclass (0x[0-9a-fA-F]+)", l)
+        if m:
+            out["class"] = int(m.group(1), 16)
+    return out
+
+
+def bt_make_agent(dbus, bus, pin, dev_name, is_paired):
+    """Construit l'agent org.bluez.Agent1. « dbus » est passé en paramètre (tests)."""
+    class Rejected(dbus.DBusException):
+        _dbus_error_name = "org.bluez.Error.Rejected"
+
+    meth = dbus.service.method
+    IF = "org.bluez.Agent1"
+
+    class Agent(dbus.service.Object):
+        @meth(IF, in_signature="", out_signature="")
+        def Release(self):
+            log("agent libéré par bluetoothd")
+
+        @meth(IF, in_signature="o", out_signature="s")
+        def RequestPinCode(self, device):
+            log("%s : code PIN demandé (jumelage)" % dev_name(device))
+            return pin
+
+        @meth(IF, in_signature="os", out_signature="")
+        def DisplayPinCode(self, device, code):
+            raise Rejected("code PIN imposé par la configuration")
+
+        @meth(IF, in_signature="o", out_signature="u")
+        def RequestPasskey(self, device):
+            log("%s : jumelage sans code PIN refusé" % dev_name(device))
+            raise Rejected("code PIN obligatoire")
+
+        @meth(IF, in_signature="ouq", out_signature="")
+        def DisplayPasskey(self, device, passkey, entered):
+            pass
+
+        @meth(IF, in_signature="ou", out_signature="")
+        def RequestConfirmation(self, device, passkey):
+            log("%s : jumelage sans code PIN refusé" % dev_name(device))
+            raise Rejected("code PIN obligatoire")
+
+        @meth(IF, in_signature="o", out_signature="")
+        def RequestAuthorization(self, device):
+            log("%s : jumelage sans code PIN refusé" % dev_name(device))
+            raise Rejected("code PIN obligatoire")
+
+        @meth(IF, in_signature="os", out_signature="")
+        def AuthorizeService(self, device, uuid):
+            if is_paired(device):
+                return
+            log("%s : service refusé (appareil non jumelé)" % dev_name(device))
+            raise Rejected("appareil non jumelé")
+
+        @meth(IF, in_signature="", out_signature="")
+        def Cancel(self):
+            log("jumelage annulé")
+
+    return Agent(bus, AGENT_PATH)
+
+
+def rfkill_unblock():
+    for d in glob.glob("/sys/class/rfkill/rfkill*"):
+        try:
+            if open(d + "/type").read().strip() != "bluetooth":
+                continue
+            if open(d + "/soft").read().strip() == "1":
+                with open(d + "/soft", "w") as f:
+                    f.write("0")
+                log("Bluetooth débloqué (rfkill)")
+        except OSError:
+            pass
+
+
+def bt_mgmt(hci, *args):
+    try:
+        return subprocess.run(["btmgmt", "-i", hci] + list(args), text=True,
+                              capture_output=True, timeout=20).stdout or ""
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        log("btmgmt %s : %s" % (" ".join(args), ex))
+        return ""
+
+
+def bt_controller_fix(hci):
+    """SSP coupé (code PIN obligatoire) et classe « haut-parleur ». Le SSP ne peut être
+    désactivé que contrôleur éteint : extinction brève (une seule fois, au démarrage)."""
+    info = mgmt_info(bt_mgmt(hci, "info"))
+    if "ssp" in info["settings"]:
+        log("%s : jumelage sans code (SSP) actif -> désactivé, code PIN obligatoire" % hci)
+        bt_mgmt(hci, "power", "off")
+        bt_mgmt(hci, "sc", "off")
+        bt_mgmt(hci, "ssp", "off")
+        bt_mgmt(hci, "power", "on")
+        info = mgmt_info(bt_mgmt(hci, "info"))
+        if "ssp" in info["settings"]:
+            log("%s : le contrôleur refuse de couper le SSP ; les jumelages sans code "
+                "restent refusés par l'agent" % hci)
+    if info["class"] is not None and (info["class"] & 0x1ffc) != BT_CLASS:
+        bt_mgmt(hci, "class", str(BT_CLASS >> 8), str(BT_CLASS & 0xfc))
+
+
+def cmd_bluetooth(c):
+    if not c.bt_enabled:
+        log("Bluetooth désactivé dans %s ([bluetooth] enabled = no)" % c.path)
+        return
+    if os.geteuid() != 0:
+        die("« bluetooth » tourne en service système (root) : systemctl status " + BT_UNIT)
+    try:
+        import dbus
+        import dbus.service
+        import dbus.mainloop.glib
+        from gi.repository import GLib
+    except ImportError:
+        die("python3-dbus / python3-gi absents : sudo bash /opt/pi-sound-server/install.sh")
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    PROPS = "org.freedesktop.DBus.Properties"
+    pin, name, disc = c.bt["pin"], c.bt_name, yes(c.bt["discoverable"])
+    state = {"registered": False, "lost": False, "noadapter": False}
+
+    def dev_get(path):
+        try:
+            return dbus.Interface(bus.get_object("org.bluez", path), PROPS).GetAll("org.bluez.Device1")
+        except dbus.DBusException:
+            return {}
+
+    def dev_name(path):
+        p = dev_get(path)
+        return "« %s » (%s)" % (p.get("Alias", "?"), p.get("Address", path))
+
+    def is_paired(path):
+        p = dev_get(path)
+        return bool(p.get("Paired")) or bool(p.get("Trusted"))
+
+    def trust(path):
+        try:
+            dbus.Interface(bus.get_object("org.bluez", path), PROPS).Set(
+                "org.bluez.Device1", "Trusted", dbus.Boolean(True))
+            log("%s : jumelé, marqué de confiance (reconnexion automatique)" % dev_name(path))
+        except dbus.DBusException as ex:
+            log("confiance impossible pour %s : %s" % (path, ex))
+
+    agent = bt_make_agent(dbus, bus, pin, dev_name, is_paired)
+
+    def on_props(iface, changed, invalidated, path=None):
+        if iface == "org.bluez.Device1" and changed.get("Paired"):
+            if not dev_get(path).get("Trusted"):
+                trust(path)
+
+    bus.add_signal_receiver(on_props, dbus_interface=PROPS, signal_name="PropertiesChanged",
+                            arg0="org.bluez.Device1", path_keyword="path")
+    loop = GLib.MainLoop()
+
+    def on_owner(nm, old, new):
+        if not new:
+            log("bluetoothd s'est arrêté : redémarrage du service")
+            state["lost"] = True
+            loop.quit()
+
+    bus.add_signal_receiver(on_owner, dbus_interface="org.freedesktop.DBus",
+                            signal_name="NameOwnerChanged", arg0="org.bluez")
+
+    def reconcile():
+        try:
+            rfkill_unblock()
+            objs = dbus.Interface(bus.get_object("org.bluez", "/"),
+                                  "org.freedesktop.DBus.ObjectManager").GetManagedObjects()
+        except dbus.DBusException as ex:
+            log("bluetoothd injoignable : %s" % ex)
+            return True
+        adapters = [p for p, i in objs.items() if "org.bluez.Adapter1" in i]
+        if not adapters:
+            if not state["noadapter"]:
+                log("aucun adaptateur Bluetooth (dtoverlay=disable-bt ? redémarrage requis ?)")
+                state["noadapter"] = True
+            return True
+        state["noadapter"] = False
+        for path in adapters:
+            bt_controller_fix(str(path).rsplit("/", 1)[-1])
+            cur = dbus.Interface(bus.get_object("org.bluez", path), PROPS).GetAll("org.bluez.Adapter1")
+            ap = dbus.Interface(bus.get_object("org.bluez", path), PROPS)
+            for k, v in (("Powered", dbus.Boolean(True)), ("Alias", dbus.String(name)),
+                         ("PairableTimeout", dbus.UInt32(0)), ("Pairable", dbus.Boolean(True)),
+                         ("DiscoverableTimeout", dbus.UInt32(0)),
+                         ("Discoverable", dbus.Boolean(disc))):
+                if cur.get(k) != v:
+                    try:
+                        ap.Set("org.bluez.Adapter1", k, v)
+                    except dbus.DBusException as ex:
+                        log("adaptateur %s : %s impossible (%s)" % (path, k, ex))
+        for path, ifs in objs.items():
+            d = ifs.get("org.bluez.Device1")
+            if d and d.get("Paired") and not d.get("Trusted"):
+                trust(path)
+        if not state["registered"]:
+            am = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"), "org.bluez.AgentManager1")
+            try:
+                am.RegisterAgent(AGENT_PATH, "KeyboardDisplay")
+                am.RequestDefaultAgent(AGENT_PATH)
+                state["registered"] = True
+                log("prêt : « %s », %s, jumelage par code PIN" % (
+                    name, "visible de tous" if disc else "invisible (appareils déjà jumelés)"))
+            except dbus.DBusException as ex:
+                log("enregistrement de l'agent impossible : %s" % ex)
+        return True
+
+    reconcile()
+    GLib.timeout_add_seconds(30, reconcile)
+    loop.run()
+    del agent
+    sys.exit(1 if state["lost"] else 0)
+
+
 def cmd_boot_config(c, path):
     sys.stdout.write(boot_transform(open(path, encoding="utf-8").read(), c))
 
@@ -1233,6 +1579,8 @@ def main():
         cmd_knob(c)
     elif cmd == "links":
         cmd_links(c, args[1:])
+    elif cmd == "bluetooth":
+        cmd_bluetooth(c)
     elif cmd == "volume":
         cmd_volume(c, args[1:])
     elif cmd == "diag":

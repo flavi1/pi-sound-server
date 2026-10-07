@@ -4,7 +4,8 @@
 
 Hub audio pour Raspberry Pi 4 / 5 sans bureau graphique : **toutes les entrées →
 MASTER → toutes les sorties**, branchement / débranchement à chaud, knob USB pour le
-volume global, Mopidy pour lire `/media`. Réseau local uniquement.
+volume global, Mopidy pour lire `/media`, enceinte Bluetooth protégée par code PIN.
+Réseau local uniquement.
 
 PipeWire + WirePlumber tournent sous un utilisateur système dédié (`hifi`).
 **Une seule configuration : `/etc/pi-sound-server/audio-hub.conf`**, appliquée par
@@ -95,11 +96,12 @@ de config) :
   (`dtoverlay=iqaudio-dacplus,unmute_amp`) et `dtparam=audio=off` ;
 - commente `dtparam=audio=on` (préfixe `#pi-sound-server# `, réversible) ;
 - ajoute `noaudio` à la ligne `dtoverlay=vc4-kms-v3d` (audio HDMI coupé, affichage
-  conservé).
+  conservé) ;
+- si `[bluetooth] enabled = yes` : commente `dtoverlay=disable-bt` (même préfixe), y
+  compris dans le bloc radio de pi-server, pour rallumer le Bluetooth.
 
 Tout est réversible (`manage = no` puis `sudo audio-hub apply` restaure l'original),
-une copie est gardée dans `config.txt.pi-sound-server.orig`, et le bloc radio de
-pi-server n'est pas touché. Un changement demande un redémarrage (signalé à la
+une copie est gardée dans `config.txt.pi-sound-server.orig`. Un changement demande un redémarrage (signalé à la
 connexion SSH).
 
 ## 3. Adapter la configuration à VOS appareils
@@ -163,6 +165,7 @@ sudo audio-hub status     # MASTER, entrées/sorties présentes, liens actifs
 | | `enabled` | `no` pour garder la section sans l'utiliser |
 | `[input.<id>]` | mêmes clés + `gain-db` | gain de l'entrée dans MASTER, en dB (-40 à +24) : équilibrer platine / PC / Mopidy |
 | `[boot]` | `manage`, `file`, `overlay`, `disable-onboard-audio`, `disable-hdmi-audio` | config.txt (voir plus haut) |
+| `[bluetooth]` | `enabled`, `name`, `pin`, `discoverable` | enceinte Bluetooth (voir § Bluetooth) |
 | `[mopidy]` | `http.port`, `mpd.port`, `media-dirs`, `iris`, `scan-interval-minutes` | |
 | | `extra-codecs` | `no` : FLAC, MP3, OGG, Opus, WAV, AIFF. `yes` : + AAC/M4A/ALAC/WMA (ffmpeg, ≈ 300 Mo), puis relancer `install.sh` |
 
@@ -196,6 +199,49 @@ débranchement du knob, et mémorise le volume (restauré au redémarrage, plafo
 
 Sensibilité : `step` (0.02 par défaut) sur l'échelle de volume de PipeWire, soit
 environ 1 à 2 dB par cran dans la plage d'écoute habituelle.
+
+### Bluetooth
+
+La Pi se présente comme une **enceinte** (nom : celui de la machine, par exemple
+`hifi`). N'importe quel téléphone peut s'y connecter, mais **seulement après avoir
+saisi le code PIN** de la configuration (`1234` par défaut) :
+
+```ini
+[bluetooth]
+enabled = yes
+name = auto          # nom affiché sur les téléphones
+pin = 1234           # 4 à 16 chiffres
+discoverable = yes   # no : seuls les téléphones déjà jumelés se connectent
+```
+
+puis `sudo audio-hub apply` (un redémarrage est demandé si `config.txt` contenait
+`dtoverlay=disable-bt`).
+
+Sur le téléphone : Bluetooth → rechercher → `hifi` → saisir le code → jouer de la
+musique. Le flux est mixé dans MASTER (le knob agit dessus) ; aucune fréquence ni aucun
+codec n'est imposé au téléphone (SBC, AAC, aptX, LDAC… selon le téléphone). Une fois
+jumelé, il est marqué « de confiance » et se reconnecte seul.
+
+**Pourquoi le téléphone demande-t-il un code ?** Les téléphones jumellent normalement
+*sans* code (« Secure Simple Pairing » : simple confirmation). Pour imposer un code,
+le service `audio-hub-bluetooth` passe le contrôleur de la Pi en jumelage **classique
+par code PIN**, et refuse toute demande de jumelage sans code. Contrepartie : un code
+à 4 chiffres est moins robuste que le jumelage moderne ; suffisant pour une enceinte de
+salon, mais choisissez un code plus long si des voisins sont à portée.
+
+Gérer les téléphones jumelés :
+
+```bash
+sudo audio-hub status                       # section BLUETOOTH : téléphones connectés, codec
+bluetoothctl devices Paired                  # téléphones jumelés
+sudo bluetoothctl remove AA:BB:CC:DD:EE:FF   # en oublier un (il devra ressaisir le code)
+sudo journalctl -u audio-hub-bluetooth -f    # jumelages, refus
+```
+
+Changer le code ne concerne que les **nouveaux** jumelages. Un téléphone jumelé
+*avant* la mise en place du code (jumelage sans code) ne se reconnecte plus : l'oublier
+des deux côtés (`bluetoothctl remove …` et dans les réglages du téléphone), puis le
+rejumeler avec le code.
 
 ## 4. Mopidy
 
@@ -233,6 +279,8 @@ cat /proc/asound/card*/pcm0p/sub0/hw_params   # idem pour le HAT (rate: 192000 a
 6. Lancer du son sur le PC : il se mélange à la platine.
 7. Éteindre le PC, puis la platine, puis les rallumer : raccordement automatique.
 8. Tourner le knob : le volume de **tout** varie ; redémarrer la Pi : volume restauré.
+9. Bluetooth : jumeler un téléphone (code demandé), jouer : son mêlé aux autres sources ;
+   un code faux est refusé.
 
 ## 7. Dépannage
 
@@ -306,4 +354,7 @@ Autres points :
 | Tout est faible | MASTER est bas (25 % ≈ -36 dB au premier démarrage) : `sudo audio-hub volume 60%` |
 | Pas de son du tout sur le HAT | `aplay -l` doit lister la carte ; sinon overlay `rpi-digiampplus,unmute_amp` dans `config.txt` |
 | Volume trop faible sur un seul appareil | son volume matériel doit être à 100 % : `sudo audio-hub diag`, section « Mixeurs ALSA » ; sinon réglage propre de l'appareil (entrée, mode ligne/casque, son propre bouton de volume) |
+| Bluetooth : la Pi n'apparaît pas sur le téléphone | `sudo audio-hub status`, `systemctl status audio-hub-bluetooth` ; `rfkill list` ; redémarrage demandé après `apply` ? ; `discoverable = yes` ? |
+| Bluetooth : le téléphone ne demande pas de code, ou échoue à se jumeler | `sudo journalctl -u audio-hub-bluetooth -b` ; s'il était déjà jumelé : l'oublier des deux côtés et recommencer |
+| Bluetooth : connecté mais pas de son | `sudo audio-hub status` (section BLUETOOTH) ; le flux doit être relié à MASTER : `pw-link -l` ; supprimer un ancien `~hifi/.config/wireplumber/wireplumber.conf.d/60-bluetooth.conf` réglé à la main |
 | Mopidy ne voit pas un disque | `sudo systemctl --user -M hifi@ start mopidy-scan`, `sudo journalctl _UID=$(id -u hifi) --user-unit=mopidy-scan` |
