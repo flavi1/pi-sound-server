@@ -76,8 +76,10 @@ mkdir -p /media
 
 if [[ "${IRIS,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
     log "Interface web Iris (pip)"
-    "${APT[@]}" install python3-pip
-    pip3 install --break-system-packages --root-user-action=ignore --upgrade Mopidy-Iris \
+    "${APT[@]}" install python3-pip python3-setuptools python3-pykka
+    # --no-deps : pip ne doit JAMAIS remplacer le Mopidy de Debian par celui de PyPI
+    # (Iris demande seulement Mopidy >= 3.0, déjà fourni par apt).
+    pip3 install --break-system-packages --root-user-action=ignore --no-deps --upgrade "Mopidy-Iris>=3.69,<4" \
         || warn "Iris non installé (Mopidy reste pilotable en MPD : port $MP)"
 fi
 
