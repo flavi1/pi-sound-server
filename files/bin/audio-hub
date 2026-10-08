@@ -74,7 +74,7 @@ BOOT_DEFAULTS = {"manage": "yes", "file": "auto", "overlay": "iqaudio-dacplus,un
                  "disable-onboard-audio": "yes", "disable-hdmi-audio": "yes"}
 MOPIDY_DEFAULTS = {"enabled": "yes", "http.port": "6680", "mpd.port": "6600",
                    "media-dirs": "/media", "iris": "yes", "scan-interval-minutes": "60",
-                   "extra-codecs": "no"}
+                   "extra-codecs": "no", "fixed-format": "yes"}
 # Bluetooth désactivé si la section est absente : ouvrir une interface radio doit
 # être un choix explicite (le modèle audio-hub.conf l'active).
 BT_DEFAULTS = {"enabled": "no", "name": "auto", "pin": "1234", "discoverable": "yes"}
@@ -413,6 +413,20 @@ def gen_wireplumber_bt(c):
     return GEN_HEADER % c.path + spa_top(doc)
 
 
+def mopidy_output(c):
+    """Sortie GStreamer de Mopidy. Avec fixed-format (défaut), tout morceau est converti
+    en flottant 32 bits stéréo à la fréquence de MASTER AVANT pipewiresink : la sortie
+    ne change jamais de format d'un morceau à l'autre. Sans cela, l'enchaînement sans
+    blanc entre deux fichiers de fréquence ou de format différents fait parfois
+    renégocier pipewiresink en pleine lecture : son haché et suraigu, ou souffle."""
+    sink = "pipewiresink target-object=%s client-name=Mopidy" % c.master
+    if not yes(c.mopidy["fixed-format"]):
+        return sink
+    q = min(10, int(c.g["resample.quality"]))      # 10 = maximum de GStreamer
+    return ("audioconvert ! audioresample quality=%d ! "
+            "audio/x-raw,format=F32LE,rate=%s,channels=2 ! %s" % (q, c.g["clock.rate"], sink))
+
+
 def gen_mopidy(c):
     m = c.mopidy
     dirs = [x.strip() for x in m["media-dirs"].split(",") if x.strip()]
@@ -427,7 +441,8 @@ verbosity = 0
 
 [audio]
 # Mopidy joue dans MASTER, qui distribue vers toutes les sorties
-output = pipewiresink target-object={master} client-name=Mopidy
+# (format fixe : [mopidy] fixed-format dans audio-hub.conf)
+output = {output}
 mixer = software
 mixer_volume = 100
 
@@ -459,7 +474,7 @@ enabled = true
 
 [stream]
 enabled = true
-{iris_sec}""".format(master=c.master, http=m["http.port"], mpd=m["mpd.port"],
+{iris_sec}""".format(output=mopidy_output(c), http=m["http.port"], mpd=m["mpd.port"],
                      default_app="default_app = iris\n" if iris else "",
                      file_dirs=file_dirs, excl=excl, local_dir=dirs[0] if dirs else "/media",
                      iris_sec="\n[iris]\ncountry = FR\nlocale = fr_FR\n" if iris else "")

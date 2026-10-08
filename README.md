@@ -167,6 +167,7 @@ sudo audio-hub status     # MASTER, entrées/sorties présentes, liens actifs
 | `[boot]` | `manage`, `file`, `overlay`, `disable-onboard-audio`, `disable-hdmi-audio` | config.txt (voir plus haut) |
 | `[bluetooth]` | `enabled`, `name`, `pin`, `discoverable` | enceinte Bluetooth (voir § Bluetooth) |
 | `[mopidy]` | `http.port`, `mpd.port`, `media-dirs`, `iris`, `scan-interval-minutes` | |
+| | `fixed-format` | `yes` : format de sortie constant (voir § Mopidy) |
 | | `extra-codecs` | `no` : FLAC, MP3, OGG, Opus, WAV, AIFF. `yes` : + AAC/M4A/ALAC/WMA (ffmpeg, ≈ 300 Mo), puis relancer `install.sh` |
 
 Ajouter un appareil = ajouter une section `[output.xxx]` ou `[input.xxx]`.
@@ -260,6 +261,11 @@ rejumeler avec le code.
   aussi toutes les `scan-interval-minutes`. Peu importe ce qui remplit `/media`
   (pi-data-server, fstab, montage manuel) : aucun lien avec un autre module.
 - Sortie : `pipewiresink target-object=MASTER` → Mopidy passe par MASTER comme le reste.
+- Format fixe (`fixed-format = yes`, défaut) : Mopidy convertit chaque morceau en
+  32 bits flottants à la fréquence de MASTER (192 kHz) avant PipeWire. Le format de sa
+  sortie ne change donc jamais entre deux morceaux ; sans cela, l'enchaînement d'un
+  fichier 44,1 kHz et d'un fichier 96 kHz (ou 16 / 24 bits) pouvait donner un son haché
+  et suraigu ou un souffle, jusqu'à ce qu'on relance la lecture.
 - Accessible uniquement depuis le réseau local (pare-feu).
 
 ## 5. Commandes utiles

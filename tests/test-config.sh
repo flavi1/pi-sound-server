@@ -41,8 +41,15 @@ fi
 python3 - "$W/gen/.config/mopidy/mopidy.conf" <<'PY' && ok "mopidy.conf lisible" || fail "mopidy.conf"
 import configparser, sys
 c = configparser.ConfigParser(interpolation=None); c.read(sys.argv[1])
-assert c["audio"]["output"].startswith("pipewiresink"), "sortie Mopidy"
+out = c["audio"]["output"]
+assert out.endswith("pipewiresink target-object=MASTER client-name=Mopidy"), "sortie Mopidy"
+assert "audio/x-raw,format=F32LE,rate=192000,channels=2" in out, "format fixe Mopidy"
+assert "audioresample quality=10" in out, "qualité du rééchantillonnage"
 PY
+sed 's/^fixed-format = yes/fixed-format = no/' "$AUDIO_HUB_CONF" > "$W/nofix.conf"
+AUDIO_HUB_CONF="$W/nofix.conf" "${HUB[@]}" generate "$W/gen-nofix" >/dev/null
+grep -q '^output = pipewiresink target-object=MASTER' "$W/gen-nofix/.config/mopidy/mopidy.conf" \
+    && ok "fixed-format = no : sortie directe" || fail "fixed-format = no"
 
 echo "== Bluetooth"
 BTW="$W/gen/.config/wireplumber/wireplumber.conf.d/51-audio-hub-bluetooth.conf"
