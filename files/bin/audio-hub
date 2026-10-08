@@ -888,7 +888,7 @@ def cmd_status(c):
     if c.bt_enabled:
         print("\n== BLUETOOTH ==")
         phones = [(nid, p, st) for nid, p, st in nodes
-                  if str(p.get("node.name", "")).startswith("bluez_")]
+                  if str(p.get("node.name", "")).startswith("bluez_input")]
         for nid, p, st in phones:
             print("  [%s] %s  état=%s  codec=%s  %s Hz" % (
                 nid, p.get("node.description", "?"), st, p.get("api.bluez5.codec", "?"),
@@ -1314,20 +1314,35 @@ def best_profile(dev):
              if pr.get("name") not in (None, "off") and pr.get("available") != "no"]
     if not cands:
         return None
-    pr = max(cands, key=lambda x: (x.get("priority", 0), x.get("available") == "yes"))
+    # « pro-audio » (accès brut, sans mixeur ni canaux nommés) en dernier recours :
+    # c'est le profil normal (analog-stereo…) que WirePlumber choisit au démarrage.
+    pr = max(cands, key=lambda x: (x.get("name") != "pro-audio", x.get("priority", 0),
+                                   x.get("available") == "yes"))
     return pr.get("index"), pr.get("name")
 
 
-def profiles_step(c, objs, last_try):
+OFF_GRACE = 8.0      # secondes laissées à WirePlumber pour choisir lui-même le profil
+
+
+def profiles_step(c, objs, last_try, now=None):
     """Un appareil USB revenu après une coupure (hub réinitialisé, DAC rallumé…) peut
     rester sur le profil « off » : sans sortie ni entrée. On active son meilleur profil,
-    au plus une tentative toutes les 10 s par appareil."""
-    now = time.monotonic()
+    au plus une tentative toutes les 10 s par appareil.
+    Un appareil qui vient d'apparaître est TOUJOURS « off » quelques instants, le
+    temps que WirePlumber lui donne son profil : on ne s'en mêle qu'après OFF_GRACE
+    secondes. (Intervenir trop tôt imposait « pro-audio » à la place du profil normal,
+    et le DAC rallumé restait parfois muet.)"""
+    now = time.monotonic() if now is None else now
+    off_since = last_try.setdefault("off_since", {})
+    seen = set()
     for o in objs:
         if o.get("type") != "PipeWire:Interface:Device":
             continue
         bp = best_profile(o)
         if bp is None:
+            continue
+        seen.add(o["id"])
+        if now - off_since.setdefault(o["id"], now) < OFF_GRACE:
             continue
         if now - last_try.get(o["id"], -1e9) < 10:
             continue
@@ -1335,6 +1350,43 @@ def profiles_step(c, objs, last_try):
         name = ((o.get("info") or {}).get("props") or {}).get("device.description", o["id"])
         as_user(c, ["wpctl", "set-profile", str(o["id"]), str(bp[0])])
         log("appareil « %s » resté sur le profil off : profil « %s » activé" % (name, bp[1]))
+    for k in list(off_since):
+        if k not in seen:
+            del off_since[k]
+
+
+def output_snapshot(c, objs, d):
+    """État d'une sortie qui vient de (ré)apparaître, pour le journal : profil de
+    l'appareil, état du nœud, flux de MASTER vers elle (état, volume, coupure), liens."""
+    nodes, devs, links = {}, {}, []
+    for o in objs:
+        t = o.get("type")
+        info = o.get("info") or {}
+        if t == "PipeWire:Interface:Node":
+            nodes[(info.get("props") or {}).get("node.name")] = o
+        elif t == "PipeWire:Interface:Device":
+            devs[o["id"]] = o
+        elif t == "PipeWire:Interface:Link":
+            links.append(info)
+    n = nodes.get(d.node_name)
+    if n is None:
+        return "sortie %s : absente" % d.id
+    ni = n.get("info") or {}
+    dev = devs.get((ni.get("props") or {}).get("device.id"))
+    prof = "?"
+    if dev:
+        prof = (((dev.get("info") or {}).get("params") or {}).get("Profile") or [{}])[0].get("name", "?")
+    out = "sortie %s : profil=%s état=%s" % (d.id, prof, ni.get("state"))
+    st = nodes.get("output.%s_%s" % (c.master, d.node_name))
+    if st is None:
+        return out + " ; flux de %s vers elle : ABSENT" % c.master
+    si = st.get("info") or {}
+    pr = ((si.get("params") or {}).get("Props") or [{}])[0]
+    vols = pr.get("channelVolumes")
+    nl = sum(1 for l in links if l.get("output-node-id") == st["id"] and l.get("input-node-id") == n["id"])
+    return out + " ; flux de %s : état=%s volume=%s muet=%s liens=%d" % (
+        c.master, si.get("state"), ",".join("%.2f" % v for v in vols) if vols else "?",
+        pr.get("mute"), nl)
 
 
 def cmd_links(c, args):
@@ -1345,12 +1397,29 @@ def cmd_links(c, args):
         return
     log("audio-hub links : surveillance des entrées et des profils USB")
     last_try = {}
+    present, pending = None, {}       # sorties présentes ; état à journaliser (id -> instant)
     while True:
         try:
             objs = pw_dump(c)
             if objs is not None:
                 links_step(c, objs=objs)
                 profiles_step(c, objs, last_try)
+                names = {((o.get("info") or {}).get("props") or {}).get("node.name") for o in objs
+                         if o.get("type") == "PipeWire:Interface:Node"}
+                now = time.monotonic()
+                cur = {d.id for d in c.outputs if d.enabled and d.node_name in names}
+                if present is not None:
+                    for i in cur - present:
+                        log("sortie %s : (ré)apparue" % i)
+                        pending[i] = now + 6
+                    for i in present - cur:
+                        log("sortie %s : disparue" % i)
+                        pending.pop(i, None)
+                present = cur
+                for d in c.outputs:
+                    if d.id in pending and now >= pending[d.id]:
+                        del pending[d.id]
+                        log(output_snapshot(c, objs, d))
         except Exception as ex:          # PipeWire en redémarrage, etc.
             log("links : %s" % ex)
         time.sleep(1.5)

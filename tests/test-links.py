@@ -113,11 +113,38 @@ objs = [dev(145, "usb", (0, "off"), PROFS),                       # DAC revenu �
         dev(59, "platform", (0, "off"), PROFS),                   # audio interne : non USB
         dev(147, "usb", (0, "off"), [(0, "off", 0, "yes"), (1, "output:x", 10, "no")])]  # rien d'utilisable
 CMDS.clear(); last = {}
-ah.profiles_step(c, objs, last)
+ah.profiles_step(c, objs, last, now=1000.0)
+check(CMDS == [], "appareil qui vient d'apparaître : WirePlumber choisit d'abord (pas d'intervention)")
+ah.profiles_step(c, objs, last, now=1005.0)
+check(CMDS == [], "toujours rien avant %g s" % ah.OFF_GRACE)
+ah.profiles_step(c, objs, last, now=1009.0)
 check(CMDS == [["wpctl", "set-profile", "145", "1"]],
-      "seul le DAC USB éteint est rallumé, sur son meilleur profil : %s" % CMDS)
-CMDS.clear(); ah.profiles_step(c, objs, last)
+      "resté « off » : seul le DAC USB est rallumé, sur le profil normal (pas pro-audio) : %s" % CMDS)
+CMDS.clear(); ah.profiles_step(c, objs, last, now=1012.0)
 check(CMDS == [], "pas de nouvelle tentative avant 10 s")
+CMDS.clear(); ah.profiles_step(c, [], last, now=1013.0)
+ah.profiles_step(c, objs, last, now=1014.0)
+check(CMDS == [], "appareil reparti puis revenu : nouveau délai de grâce")
+
+PRO_FIRST = [(0, "off", 0, "yes"), (2, "pro-audio", 9000, "yes"), (1, "output:analog-stereo", 6500, "unknown")]
+check(ah.best_profile(dev(150, "usb", (0, "off"), PRO_FIRST)) == (1, "output:analog-stereo"),
+      "profil normal préféré à pro-audio, même de priorité plus faible")
+check(ah.best_profile(dev(151, "usb", (0, "off"), [(0, "off", 0, "yes"), (2, "pro-audio", 1, "yes")])) == (2, "pro-audio"),
+      "pro-audio seulement en dernier recours")
+
+print("== état d'une sortie revenue (journal)")
+d_dac = next(d for d in c.outputs if d.id == "dac")
+snap_objs = [
+    {"id": 145, "type": "PipeWire:Interface:Device", "info": {"params": {"Profile": [{"name": "output:analog-stereo"}]}}},
+    {"id": 118, "type": "PipeWire:Interface:Node", "info": {"state": "running", "props": {"node.name": "hub.out.dac", "device.id": 145}}},
+    {"id": 120, "type": "PipeWire:Interface:Node", "info": {"state": "running", "props": {"node.name": "output.MASTER_hub.out.dac"},
+                                                             "params": {"Props": [{"channelVolumes": [1.0, 1.0], "mute": False}]}}},
+    {"id": 300, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 120, "input-node-id": 118}},
+    {"id": 301, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 120, "input-node-id": 118}}]
+snap = ah.output_snapshot(c, snap_objs, d_dac)
+check(snap == "sortie dac : profil=output:analog-stereo état=running ; flux de MASTER : état=running volume=1.00,1.00 muet=False liens=2",
+      "résumé : %s" % snap)
+check("ABSENT" in ah.output_snapshot(c, snap_objs[:2], d_dac), "flux de MASTER manquant signalé")
 
 print("== format des flux (audio-hub status)")
 objs = [{"type": "PipeWire:Interface:Node", "info": {"state": "running",

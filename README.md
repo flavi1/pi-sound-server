@@ -357,7 +357,7 @@ Autres points :
 |---|---|
 | `MASTER ABSENT` | `sudo journalctl -b _SYSTEMD_USER_UNIT=pipewire.service` : erreur de syntaxe ou module manquant |
 | Doute général | `sudo audio-hub diag` : rapport complet dans `/tmp/audio-hub-diag.txt` |
-| Un appareil USB ne revient pas après une coupure (hub USB réinitialisé, DAC rallumé) alors qu'il apparaît dans `aplay -l` | WirePlumber l'a laissé sur le profil « off » ; `audio-hub-links` le rallume seul en quelques secondes : `sudo journalctl -f _SYSTEMD_USER_UNIT=audio-hub-links.service` |
+| Un appareil USB ne revient pas après une coupure (hub USB réinitialisé, DAC rallumé) alors qu'il apparaît dans `aplay -l` | si WirePlumber le laisse plus de 8 s sur le profil « off », `audio-hub-links` active son profil normal. À chaque retour d'une sortie, son état est noté dans le journal (profil, flux de MASTER, volume, liens) : `sudo journalctl -b _SYSTEMD_USER_UNIT=audio-hub-links.service` ; en cas de silence, envoyer ces lignes. Contournement : couper le courant du DAC 5 s |
 | Silence partout alors que tout est « running » | une entrée absente reliée à MASTER : `systemctl --user -M hifi@ status audio-hub-links`, `sudo audio-hub links once` |
 | Appareil `absente` alors qu'il est branché | ses `match.*` ne correspondent pas : `sudo audio-hub list` |
 | Craquements | `clock.quantum = 2048`, puis `period-size = 1024` / `headroom = 1024` sur l'appareil USB ; baisser `resample.quality` si le CPU sature (`top`) |
