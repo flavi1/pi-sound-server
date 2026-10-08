@@ -119,6 +119,15 @@ check(CMDS == [["wpctl", "set-profile", "145", "1"]],
 CMDS.clear(); ah.profiles_step(c, objs, last)
 check(CMDS == [], "pas de nouvelle tentative avant 10 s")
 
+print("== format des flux (audio-hub status)")
+objs = [{"type": "PipeWire:Interface:Node", "info": {"state": "running",
+         "props": {"media.class": "Stream/Output/Audio", "application.name": "Mopidy"},
+         "params": {"Format": [{"format": "F32LE", "rate": 192000, "channels": 2}]}}},
+        {"type": "PipeWire:Interface:Node", "info": {"state": "running",
+         "props": {"media.class": "Audio/Sink", "node.name": "MASTER"}, "params": {}}}]
+check(ah.stream_formats(objs) == [("Mopidy", "running", "F32LE 192000 Hz 2 canaux")],
+      "Mopidy : format négocié affiché, MASTER ignoré")
+
 print()
 print("%d échec(s)" % FAILS)
 sys.exit(1 if FAILS else 0)

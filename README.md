@@ -265,7 +265,8 @@ rejumeler avec le code.
   32 bits flottants à la fréquence de MASTER (192 kHz) avant PipeWire. Le format de sa
   sortie ne change donc jamais entre deux morceaux ; sans cela, l'enchaînement d'un
   fichier 44,1 kHz et d'un fichier 96 kHz (ou 16 / 24 bits) pouvait donner un son haché
-  et suraigu ou un souffle, jusqu'à ce qu'on relance la lecture.
+  et suraigu ou un souffle, jusqu'à ce qu'on relance la lecture. Vérifier :
+  `sudo audio-hub status`, section FLUX (`Mopidy … F32LE 192000 Hz 2 canaux`).
 - Accessible uniquement depuis le réseau local (pare-feu).
 
 ## 5. Commandes utiles

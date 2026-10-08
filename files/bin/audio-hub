@@ -829,6 +829,24 @@ def cmd_list(c):
     print("  match.node.name = ~alsa_output\\.usb-Fabricant_Produit.*")
 
 
+def stream_formats(objs):
+    """Flux de lecture (Mopidy, téléphones Bluetooth…) : [(nom, état, format négocié)]."""
+    out = []
+    for o in objs:
+        if o.get("type") != "PipeWire:Interface:Node":
+            continue
+        info = o.get("info") or {}
+        props = info.get("props") or {}
+        if not str(props.get("media.class", "")).startswith("Stream/Output/Audio"):
+            continue
+        name = props.get("application.name") or props.get("node.description") or props.get("node.name", "?")
+        f = ((info.get("params") or {}).get("Format") or [{}])[0]
+        fmt = ("%s %s Hz %s canaux" % (f.get("format", "?"), f.get("rate", "?"), f.get("channels", "?"))
+               if f else "format non négocié (pas de lecture)")
+        out.append((str(name), str(info.get("state", "?")), fmt))
+    return out
+
+
 def cmd_status(c):
     nodes = pw_nodes(c)
     if not nodes:
@@ -852,6 +870,12 @@ def cmd_status(c):
                     d.id, nid, d.description, st, p.get("audio.rate", "?")))
             else:
                 print("  %-12s absente   (%s)" % (d.id, d.description))
+    print("\n== FLUX (applications, téléphones) ==")
+    flows = stream_formats(pw_dump(c) or [])
+    for name, st, fmt in flows:
+        print("  %-28s état=%-9s %s" % (name, st, fmt))
+    if not flows:
+        print("  (aucun)")
     print("\n== LIENS ==")
     r = as_user(c, ["pw-link", "-l"])
     shown = False
