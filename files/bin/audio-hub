@@ -28,6 +28,8 @@
 #                              les appareils USB revenus sur le profil « off »
 #
 #  Service système (root) :
+#  audio-hub ready             attend que tout le serveur son soit prêt et
+#                              l'annonce sur la console et aux sessions ouvertes
 #  audio-hub bluetooth         enceinte Bluetooth : visible, jumelage par code PIN
 #                              obligatoire (section [bluetooth]), appareils jumelés
 #                              marqués de confiance (reconnexion automatique)
@@ -407,6 +409,11 @@ def gen_wireplumber_bt(c):
             "actions": {"update-props": {
                 "priority.driver": 100,              # ne pilote jamais l'horloge
                 "session.suspend-timeout-seconds": 0,
+                # Toujours vers MASTER, pas vers « la sortie par défaut du
+                # moment » : un téléphone connecté très tôt après le démarrage
+                # pouvait être relié à une sortie seule (DAC en veille…) avant
+                # que MASTER ne devienne la sortie par défaut.
+                "target.object": c.master,
             }},
         }],
     }
@@ -844,6 +851,8 @@ def cmd_apply(c):
         systemctl_user(c, "restart", "mopidy-scan.timer", "mopidy-scan.path")
     log("Bluetooth :")
     apply_bluetooth(c)
+    if os.path.exists("/etc/systemd/system/" + READY_UNIT):
+        subprocess.run(["systemctl", "restart", "--no-block", READY_UNIT], capture_output=True)
     time.sleep(2)
     cmd_status(c)
 
@@ -1849,6 +1858,122 @@ def cmd_bluetooth(c):
     sys.exit(1 if state["lost"] else 0)
 
 
+# =============================================================================
+#  « Serveur son prêt » : annonce sur la console et aux sessions ouvertes
+# =============================================================================
+READY_FILE = "/run/pi-sound-server/ready"
+READY_UNIT = "audio-hub-ready.service"
+
+
+def default_sink(objs):
+    for o in objs:
+        if o.get("type") == "PipeWire:Interface:Metadata" and \
+                (o.get("props") or {}).get("metadata.name") == "default":
+            for e in o.get("metadata") or []:
+                if e.get("key") == "default.audio.sink":
+                    v = e.get("value")
+                    return v.get("name") if isinstance(v, dict) else v
+    return None
+
+
+def ready_check(c, objs, units, bt_sink):
+    """objs : pw-dump ; units : {unité utilisateur: actif ?} ; bt_sink : enceinte
+    Bluetooth annoncée (None si Bluetooth désactivé). -> (prêt, [présent], [manquant])"""
+    names = {((o.get("info") or {}).get("props") or {}).get("node.name") for o in objs
+             if o.get("type") == "PipeWire:Interface:Node"}
+    ok, missing = [], []
+    if c.master in names:
+        ok.append(c.master)
+    else:
+        missing.append(c.master)
+    if default_sink(objs) != c.master:
+        missing.append("%s par défaut" % c.master)
+    outs = [d.id for d in c.outputs if d.enabled and d.node_name in names]
+    if outs:
+        ok.append("sorties " + ", ".join(outs))
+    else:
+        missing.append("aucune sortie")
+    for unit, label in (("audio-hub-init.service", "initialisation"),
+                        ("audio-hub-links.service", "liens des entrées"),
+                        ("audio-hub-knob.service", "knob"),
+                        ("mopidy.service", "Mopidy")):
+        if unit not in units:
+            continue
+        if units[unit]:
+            if label in ("knob", "Mopidy"):
+                ok.append(label)
+        else:
+            missing.append(label)
+    if bt_sink is not None:
+        if bt_sink:
+            ok.append("Bluetooth « %s »" % c.bt_name)
+        else:
+            missing.append("Bluetooth")
+    return not missing, ok, missing
+
+
+def announce(msg):
+    """Console (écran, port série) + toutes les sessions ouvertes (SSH, tty) + fichier
+    lu à la connexion (/etc/profile.d/pi-sound-server.sh)."""
+    log(msg)
+    try:
+        os.makedirs(os.path.dirname(READY_FILE), exist_ok=True)
+        with open(READY_FILE, "w", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+    try:
+        with open("/dev/console", "w") as f:
+            f.write("\r\n" + msg + "\r\n")
+    except OSError:
+        pass
+    subprocess.run(["wall", "-n", msg], capture_output=True)
+
+
+def cmd_ready(c, args):
+    if os.geteuid() != 0:
+        die("« ready » tourne en service système (root) : systemctl status " + READY_UNIT)
+    timeout = 240
+    start = time.monotonic()
+    try:
+        os.remove(READY_FILE)
+    except OSError:
+        pass
+    units = ["audio-hub-init.service", "audio-hub-links.service"]
+    if yes(c.knob["enabled"]):
+        units.append("audio-hub-knob.service")
+    if yes(c.mopidy["enabled"]):
+        units.append("mopidy.service")
+    ok, missing = False, ["PipeWire"]
+    stable = 0
+    while time.monotonic() - start < timeout:
+        objs = pw_dump(c) if c.uid is not None else None
+        if objs:
+            act = {u: (systemctl_user(c, "is-active", u).stdout or "").strip() == "active"
+                   for u in units}
+            bt = None
+            if c.bt_enabled:
+                r = subprocess.run(["bluetoothctl", "show"], text=True, capture_output=True)
+                bt = ("0000110b-" in (r.stdout or "")) and subprocess.run(
+                    ["systemctl", "is-active", "--quiet", BT_UNIT]).returncode == 0
+            ok, present, missing = ready_check(c, objs, act, bt)
+            # deux contrôles réussis d'affilée : rien n'est en train de redémarrer
+            stable = stable + 1 if ok else 0
+            if stable >= 2:
+                break
+        time.sleep(3)
+    try:
+        up = float(open("/proc/uptime").read().split()[0])
+        when = "%s, %d s après le démarrage de la Pi" % (time.strftime("%H:%M:%S"), up)
+    except (OSError, ValueError):
+        when = time.strftime("%H:%M:%S")
+    if ok:
+        announce("*** pi-sound-server PRÊT (%s) : %s ***" % (when, " · ".join(present)))
+    else:
+        announce("*** pi-sound-server PAS PRÊT après %d s (%s) — manque : %s ; "
+                 "voir : sudo audio-hub status ***" % (timeout, when, ", ".join(missing)))
+
+
 def cmd_boot_config(c, path):
     sys.stdout.write(boot_transform(open(path, encoding="utf-8").read(), c))
 
@@ -1882,6 +2007,8 @@ def main():
         cmd_links(c, args[1:])
     elif cmd == "bluetooth":
         cmd_bluetooth(c)
+    elif cmd == "ready":
+        cmd_ready(c, args[1:])
     elif cmd == "volume":
         cmd_volume(c, args[1:])
     elif cmd == "diag":

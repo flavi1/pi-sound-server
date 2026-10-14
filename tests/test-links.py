@@ -155,6 +155,19 @@ objs = [{"type": "PipeWire:Interface:Node", "info": {"state": "running",
 check(ah.stream_formats(objs) == [("Mopidy", "running", "F32LE 192000 Hz 2 canaux")],
       "Mopidy : format négocié affiché, MASTER ignoré")
 
+print("== serveur son prêt ?")
+def nd(name):
+    return {"type": "PipeWire:Interface:Node", "info": {"props": {"node.name": name}}}
+meta = {"type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+        "metadata": [{"key": "default.audio.sink", "value": {"name": "MASTER"}}]}
+units = {"audio-hub-init.service": True, "audio-hub-links.service": True, "mopidy.service": True}
+ok, present, missing = ah.ready_check(c, [nd("MASTER"), nd("hub.out.amp"), meta], units, True)
+check(ok and present == ["MASTER", "sorties amp", "Mopidy", "Bluetooth « %s »" % c.bt_name],
+      "tout est prêt : %s" % present)
+ok, present, missing = ah.ready_check(c, [nd("MASTER"), nd("hub.out.amp")], dict(units, **{"mopidy.service": False}), False)
+check(not ok and missing == ["MASTER par défaut", "Mopidy", "Bluetooth"],
+      "manques signalés : %s" % missing)
+
 print()
 print("%d échec(s)" % FAILS)
 sys.exit(1 if FAILS else 0)

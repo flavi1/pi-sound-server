@@ -19,7 +19,7 @@ jobs:
       - name: Syntaxe bash + ShellCheck
         run: |
           for f in install.sh files/bin/audio-hub-diag tests/*.sh; do bash -n "$f"; done
-          shellcheck -S warning install.sh files/bin/audio-hub-diag tests/*.sh
+          shellcheck -S warning install.sh files/bin/audio-hub-diag files/profile.d/*.sh tests/*.sh
       - name: Python (compilation + pyflakes)
         run: |
           python3 -m py_compile files/bin/audio-hub

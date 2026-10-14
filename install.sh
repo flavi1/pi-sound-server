@@ -158,7 +158,11 @@ done
 
 # --- Service système Bluetooth (activé ou non par « audio-hub apply ») -------------
 install -m 644 "$F/system-units/audio-hub-bluetooth.service" /etc/systemd/system/
+# Annonce « serveur son prêt » (console, sessions ouvertes, connexion SSH)
+install -m 644 "$F/system-units/audio-hub-ready.service" /etc/systemd/system/
+install -m 644 "$F/profile.d/pi-sound-server.sh" /etc/profile.d/pi-sound-server.sh
 systemctl daemon-reload
+systemctl enable audio-hub-ready.service
 
 # --- Pare-feu (seulement si un pare-feu pi-server est en place) ----------------------
 if [[ -f /etc/nftables.d/00-lan.nft ]] && grep -q 'nftables.d/\[1-9\]' /etc/nftables.conf 2>/dev/null; then

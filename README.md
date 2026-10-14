@@ -271,6 +271,20 @@ rejumeler avec le code.
 
 ## 5. Commandes utiles
 
+**Serveur son prêt ?** Au démarrage (et après chaque `audio-hub apply`), le service
+`audio-hub-ready` attend que tout soit en place : MASTER présent **et** sortie par
+défaut, au moins une sortie, initialisation, liens des entrées, knob, Mopidy,
+Bluetooth (enceinte annoncée). Il l'annonce alors sur la console, dans toutes les
+sessions SSH ouvertes, et à chaque nouvelle connexion :
+
+```
+*** pi-sound-server PRÊT (13:20:41, 52 s après le démarrage de la Pi) : MASTER · sorties amp, dac · knob · Mopidy · Bluetooth « hifi » ***
+```
+
+Un souci *après* ce message n'est pas un démarrage trop récent. Sans message au bout
+de 4 minutes : `*** pi-sound-server PAS PRÊT … — manque : … ***`.
+
+
 ```bash
 sudo audio-hub status
 sudo audio-hub list

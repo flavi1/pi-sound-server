@@ -1,0 +1,15 @@
+# Service système : attend que tout le serveur son soit prêt (MASTER par défaut,
+# sorties, Mopidy, knob, Bluetooth…) puis l'annonce sur la console, aux sessions
+# ouvertes (wall) et à chaque connexion SSH. Relancé par « audio-hub apply ».
+[Unit]
+Description=audio-hub : annonce « serveur son prêt »
+Wants=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/audio-hub ready
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
