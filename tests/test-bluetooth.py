@@ -151,6 +151,17 @@ w.feed(3, 0, lk(ADDR)); w.feed(3, 0, cc(ADDR, 12))
 clock[0] += 30
 check(w.feed(17, 0, cf(ADDR)) == [], "abandon trop tardif (30 s) : pas lié au jumelage, rien n'est coupé")
 
+print("== /etc/bluetooth/main.conf : ReverseServiceDiscovery = false")
+DEB = "[General]\n#Name = BlueZ\n#ReverseServiceDiscovery = true\n#FastConnectable = false\n\n[Policy]\n#ReverseServiceDiscovery = true\n"
+out = ah.bluez_main_transform(DEB)
+check("[General]\n#Name = BlueZ\nReverseServiceDiscovery = false\n" in out and out.endswith("[Policy]\n#ReverseServiceDiscovery = true\n"),
+      "ligne commentée de [General] remplacée, autres sections intactes")
+check(ah.bluez_main_transform(out) == out, "idempotent")
+check("[General]\nReverseServiceDiscovery = false\n#Name" in ah.bluez_main_transform("[General]\n#Name = x\n"),
+      "ligne absente : ajoutée sous [General]")
+check(ah.bluez_main_transform("[Policy]\n").endswith("[General]\nReverseServiceDiscovery = false\n"),
+      "section [General] absente : créée")
+
 print()
 print("%d échec(s)" % FAILS)
 sys.exit(1 if FAILS else 0)

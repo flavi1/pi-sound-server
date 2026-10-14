@@ -370,5 +370,6 @@ Autres points :
 | Volume trop faible sur un seul appareil | son volume matériel doit être à 100 % : `sudo audio-hub diag`, section « Mixeurs ALSA » ; sinon réglage propre de l'appareil (entrée, mode ligne/casque, son propre bouton de volume) |
 | Bluetooth : la Pi n'apparaît pas sur le téléphone | `sudo audio-hub status`, `systemctl status audio-hub-bluetooth` ; `rfkill list` ; redémarrage demandé après `apply` ? ; `discoverable = yes` ? |
 | Bluetooth : le téléphone ne demande pas de code, ou échoue à se jumeler | `sudo journalctl -u audio-hub-bluetooth -b` ; s'il était déjà jumelé : l'oublier des deux côtés et recommencer |
+| Bluetooth : code et jumelage OK, mais la connexion n'aboutit jamais (téléphone déjà associé ou non) | `bluetoothd` attendait la liste des services du téléphone, jamais lue : `audio-hub apply` règle `ReverseServiceDiscovery = false` dans `/etc/bluetooth/main.conf` ; vérifier `grep ReverseServiceDiscovery /etc/bluetooth/main.conf` |
 | Bluetooth : connecté mais pas de son | `sudo audio-hub status` (section BLUETOOTH) ; le flux doit être relié à MASTER : `pw-link -l` ; supprimer un ancien `~hifi/.config/wireplumber/wireplumber.conf.d/60-bluetooth.conf` réglé à la main |
 | Mopidy ne voit pas un disque | `sudo systemctl --user -M hifi@ start mopidy-scan`, `sudo journalctl _UID=$(id -u hifi) --user-unit=mopidy-scan` |

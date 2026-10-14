@@ -737,6 +737,36 @@ def cmd_generate(c, outdir):
         print("écrit", p)
 
 
+BLUEZ_MAIN_CONF = "/etc/bluetooth/main.conf"
+
+
+def bluez_main_transform(text):
+    """/etc/bluetooth/main.conf : ReverseServiceDiscovery = false dans [General].
+    Par défaut, bluetoothd n'autorise la connexion audio d'un téléphone de confiance
+    qu'après avoir lu la liste de ses services. Si cette lecture a échoué au jumelage
+    (cas du jumelage par code PIN rattrapé, voir plus bas), il l'attend indéfiniment :
+    connexion bloquée sur « Authorization pending », sans aucun message. Pour une
+    enceinte, cette liste ne sert à rien."""
+    want = "ReverseServiceDiscovery = false"
+    lines = text.split("\n")
+    sec = None
+    general = None
+    for i, l in enumerate(lines):
+        st = l.strip()
+        if st.startswith("[") and st.endswith("]"):
+            sec = st
+            if st == "[General]":
+                general = i
+            continue
+        if sec == "[General]" and re.match(r"^#?\s*ReverseServiceDiscovery\s*=", st):
+            lines[i] = want
+            return "\n".join(lines)
+    if general is None:
+        return text.rstrip("\n") + "\n\n[General]\n" + want + "\n"
+    lines.insert(general + 1, want)
+    return "\n".join(lines)
+
+
 def apply_bluetooth(c):
     """Service système audio-hub-bluetooth (root) : activé / désactivé selon la config,
     redémarré pour relire le code PIN et le nom."""
@@ -759,6 +789,14 @@ def apply_bluetooth(c):
         log("  BlueZ absent : relancez sudo bash /opt/pi-sound-server/install.sh")
         return
     sc("daemon-reload")
+    if os.path.exists(BLUEZ_MAIN_CONF):
+        old = open(BLUEZ_MAIN_CONF, encoding="utf-8").read()
+        new = bluez_main_transform(old)
+        if new != old:
+            with open(BLUEZ_MAIN_CONF, "w", encoding="utf-8") as f:
+                f.write(new)
+            log("  %s : ReverseServiceDiscovery = false" % BLUEZ_MAIN_CONF)
+            sc("restart", "bluetooth.service")
     sc("enable", "--now", "bluetooth.service")
     sc("enable", BT_UNIT)
     r = sc("restart", BT_UNIT)
