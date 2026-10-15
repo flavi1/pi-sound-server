@@ -258,34 +258,68 @@ def spa_top(d):
 # =============================================================================
 #  Génération
 # =============================================================================
+def out_loop(d):
+    """Nom de base de la boucle MASTER -> sortie d."""
+    return "hub.master.%s" % d.id
+
+
 def gen_pipewire(c):
+    """MASTER est une sortie virtuelle simple (support.null-audio-sink). Chaque sortie
+    candidate reçoit MASTER par sa propre boucle (module-loopback) : capture du
+    moniteur de MASTER -> lecture vers l'appareil. Les liens boucle -> appareil sont
+    posés et retirés par « audio-hub links » quand l'appareil apparaît / disparaît.
+    (Avant : module combine-stream, qui gérait mal le départ d'un appareil — « out of
+    playback buffers » en rafale, sortie muette, voire PipeWire figé.)"""
     master = c.master
-    stream_rules = []
+    q = int(c.g["resample.quality"])
+    objects = [{
+        "factory": "adapter",
+        "args": {
+            "factory.name": "support.null-audio-sink",
+            "node.name": master,
+            "node.description": c.g["master.description"],
+            "media.class": "Audio/Sink",
+            "audio.position": ["FL", "FR"],
+            # Le volume et la coupure de MASTER (knob) s'appliquent à ce qui part
+            # vers les sorties (ports « moniteur »).
+            "monitor.channel-volumes": True,
+            "object.linger": True,
+            "priority.session": 3000,
+            "priority.driver": 10,             # l'horloge reste celle du HAT
+            "node.pause-on-idle": False,
+            "session.suspend-timeout-seconds": 0,
+        },
+    }]
+    modules = []
     for d in c.outputs:
         if not d.enabled:
             continue
-        stream_rules.append({
-            "matches": [{"media.class": "Audio/Sink", "node.name": d.node_name}],
-            "actions": {"create-stream": {}},
-        })
-    modules = [{
-        "name": "libpipewire-module-combine-stream",
-        "args": {
-            "combine.mode": "sink",
-            "node.name": master,
-            "node.description": c.g["master.description"],
-            "combine.latency-compensate": yes(c.g["latency-compensate"]),
-            "combine.props": {
+        base = out_loop(d)
+        modules.append({
+            "name": "libpipewire-module-loopback",
+            "args": {
+                "node.description": "%s -> %s" % (master, d.description),
                 "audio.position": ["FL", "FR"],
-                "priority.session": 3000,
-                "node.pause-on-idle": False,
+                "capture.props": {
+                    "node.name": base + ".capture",
+                    "node.description": "%s -> %s (capture)" % (master, d.description),
+                    "stream.capture.sink": True,      # moniteur de MASTER
+                    "target.object": master,
+                    "node.dont-fallback": True,
+                    "node.dont-move": True,
+                },
+                "playback.props": {
+                    "node.name": base + ".playback",
+                    "node.description": "%s -> %s" % (master, d.description),
+                    # Jamais de lien automatique : WirePlumber pourrait, à défaut de
+                    # l'appareil, relier la boucle à MASTER lui-même (boucle de
+                    # larsen). « audio-hub links » ne la relie qu'à SON appareil.
+                    "node.autoconnect": False,
+                    "node.dont-move": True,
+                    "resample.quality": q,
+                },
             },
-            "stream.props": {
-                "resample.quality": int(c.g["resample.quality"]),
-            },
-            "stream.rules": stream_rules,
-        },
-    }]
+        })
     for d in c.inputs:
         if not d.enabled:
             continue
@@ -329,6 +363,7 @@ def gen_pipewire(c):
         },
         "stream.properties": {"resample.quality": int(c.g["resample.quality"])},
         "context.modules": modules,
+        "context.objects": objects,
     }
     return GEN_HEADER % c.path + spa_top(doc)
 
@@ -645,7 +680,13 @@ def user_env(c):
     return env
 
 
-def as_user(c, cmd, check=False, capture=True):
+class _Timeout:
+    returncode = 124
+    stdout = ""
+    stderr = "délai dépassé"
+
+
+def as_user(c, cmd, check=False, capture=True, timeout=20):
     if c.uid is None:
         die("l'utilisateur « %s » n'existe pas (lancez l'installeur)" % c.user)
     if os.geteuid() == c.uid:
@@ -654,9 +695,12 @@ def as_user(c, cmd, check=False, capture=True):
         full = ["runuser", "-u", c.user, "--"] + cmd
     else:
         die("à lancer avec sudo (ou en tant que « %s »)" % c.user)
-    r = subprocess.run(full, env=user_env(c), text=True,
-                       stdout=subprocess.PIPE if capture else None,
-                       stderr=subprocess.PIPE if capture else None)
+    try:
+        r = subprocess.run(full, env=user_env(c), text=True, timeout=timeout,
+                           stdout=subprocess.PIPE if capture else None,
+                           stderr=subprocess.PIPE if capture else None)
+    except subprocess.TimeoutExpired:
+        r = _Timeout()                     # PipeWire ne répond pas
     if check and r.returncode != 0:
         die("échec : %s\n%s" % (" ".join(cmd), (r.stderr or "").strip()))
     return r
@@ -726,6 +770,8 @@ def cmd_check(c):
         print("  sortie %-12s -> %-22s %s %s" % (d.id, d.node_name, "" if d.enabled else "[désactivée]", d.match))
     for d in c.inputs:
         print("  entrée %-12s -> %-22s %s %s" % (d.id, d.node_name, "" if d.enabled else "[désactivée]", d.match))
+    if yes(c.g["latency-compensate"]):
+        print("  (latency-compensate ignoré : plus de compensation de latence entre sorties)")
     print("  knob         : %s (%s)" % ("actif" if yes(c.knob["enabled"]) else "inactif", c.knob["device"]))
     print("  mopidy       : %s" % ("actif" if yes(c.mopidy["enabled"]) else "inactif"))
     if c.bt_enabled:
@@ -1352,6 +1398,34 @@ def links_step(c, verbose=False, objs=None):
             log("entrée %s : déliée de %s (appareil absent ou inactif)" % (d.id, c.master))
         elif verbose:
             log("entrée %s : %s" % (d.id, "reliée" if linked else "absente"))
+    # Sorties : boucle MASTER -> appareil, reliée seulement à SON appareil, présent
+    for d in c.outputs:
+        if not d.enabled:
+            continue
+        play = nodes.get(out_loop(d) + ".playback")
+        dev = nodes.get(d.node_name)
+        if play is None:
+            continue
+        outs = sorted(name for pid, (nid, name, dr) in ports.items()
+                      if nid == play["id"] and dr == "output")
+        linked = [(op, ip) for (on, op, inn, ip) in links if on == play["id"]]
+        wrong = [(op, ip) for (on, op, inn, ip) in links
+                 if on == play["id"] and (dev is None or inn != dev["id"])]
+        for (op, ip) in wrong:                 # jamais ailleurs que vers l'appareil
+            as_user(c, ["pw-link", "-d", str(op), str(ip)])
+        if dev is None:
+            continue
+        ins = sorted(name for pid, (nid, name, dr) in ports.items()
+                     if nid == dev["id"] and dr == "input")
+        if not ins or not outs:
+            continue
+        if len([x for x in linked if x not in wrong]) < min(len(outs), len(ins)):
+            for o, i in zip(outs, ins):         # FL->FL, FR->FR (ou AUX0, AUX1)
+                as_user(c, ["pw-link", "%s:%s" % (out_loop(d) + ".playback", o),
+                            "%s:%s" % (d.node_name, i)])
+            log("sortie %s : reliée à %s" % (d.id, c.master))
+        elif verbose:
+            log("sortie %s : reliée" % d.id)
 
 
 def best_profile(dev):
@@ -1433,7 +1507,7 @@ def output_snapshot(c, objs, d):
     if dev:
         prof = (((dev.get("info") or {}).get("params") or {}).get("Profile") or [{}])[0].get("name", "?")
     out = "sortie %s : profil=%s état=%s" % (d.id, prof, ni.get("state"))
-    st = nodes.get("output.%s_%s" % (c.master, d.node_name))
+    st = nodes.get(out_loop(d) + ".playback")
     if st is None:
         return out + " ; flux de %s vers elle : ABSENT" % c.master
     si = st.get("info") or {}
@@ -1445,6 +1519,35 @@ def output_snapshot(c, objs, d):
         pr.get("mute"), nl)
 
 
+def pipewire_active(c):
+    return (systemctl_user(c, "is-active", "pipewire.service").stdout or "").strip() == "active"
+
+
+class HangWatch:
+    """PipeWire « actif » pour systemd mais qui ne répond plus (constaté : pw-dump,
+    wpctl et pw-cli bloqués) : au bout de LIMIT secondes, il faut relancer la pile.
+    Au plus une relance toutes les 5 minutes."""
+    LIMIT = 60
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.since = None
+        self.last = -1e9
+
+    def step(self, answered, active):
+        now = self.clock()
+        if answered or not active:          # répond, ou systemd le relance déjà
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now
+        if now - self.since >= self.LIMIT and now - self.last >= 300:
+            self.last = now
+            self.since = None
+            return True
+        return False
+
+
 def cmd_links(c, args):
     if args and args[0] == "once":
         objs = pw_dump(c) or []
@@ -1454,9 +1557,16 @@ def cmd_links(c, args):
     log("audio-hub links : surveillance des entrées et des profils USB")
     last_try = {}
     present, pending = None, {}       # sorties présentes ; état à journaliser (id -> instant)
+    hang = HangWatch()
     while True:
         try:
             objs = pw_dump(c)
+            if hang.step(objs is not None, pipewire_active(c)):
+                log("PipeWire ne répond plus depuis %d s : relance de la pile audio" % HangWatch.LIMIT)
+                systemctl_user(c, "restart", "pipewire.service", "wireplumber.service")
+                systemctl_user(c, "restart", "audio-hub-init.service")
+                time.sleep(10)
+                continue
             if objs is not None:
                 links_step(c, objs=objs)
                 profiles_step(c, objs, last_try)

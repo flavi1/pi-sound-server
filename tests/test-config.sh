@@ -23,10 +23,14 @@ for f in .config/pipewire/pipewire.conf.d/50-audio-hub.conf \
          .config/systemd/user/mopidy-scan.timer .config/systemd/user/mopidy-scan.path; do
     [[ -s "$W/gen/$f" ]] && ok "$f" || fail "$f manquant"
 done
-grep -q 'name = "libpipewire-module-combine-stream"' "$W/gen/.config/pipewire/pipewire.conf.d/50-audio-hub.conf" \
-    && ok "MASTER (combine-stream) présent" || fail "combine-stream absent"
+PWC="$W/gen/.config/pipewire/pipewire.conf.d/50-audio-hub.conf"
+grep -q 'factory.name = "support.null-audio-sink"' "$PWC" && ok "MASTER : sortie virtuelle simple" || fail "MASTER absent"
+grep -q 'monitor.channel-volumes = true' "$PWC" && ok "volume / coupure de MASTER appliqués aux sorties" || fail "monitor.channel-volumes"
+grep -q 'combine-stream' "$PWC" && fail "combine-stream encore utilisé" || ok "plus de combine-stream"
+n_out="$(grep -c 'stream.capture.sink = true' "$PWC")"
+[[ "$n_out" -eq 2 ]] && ok "une boucle par sortie (amp, dac)" || fail "boucles de sortie : $n_out"
 n_in="$(grep -c 'libpipewire-module-loopback' "$W/gen/.config/pipewire/pipewire.conf.d/50-audio-hub.conf")"
-[[ "$n_in" -ge 1 ]] && ok "$n_in boucle(s) d'entrée" || fail "aucune boucle d'entrée"
+[[ "$n_in" -ge 1 ]] && ok "$n_in boucle(s) (entrées + sorties)" || fail "aucune boucle"
 
 # Syntaxe SPA-JSON, si l'outil de PipeWire est disponible
 if command -v spa-json-dump >/dev/null; then

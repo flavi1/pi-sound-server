@@ -26,9 +26,11 @@ automatiques, pare-feu, SSH) et la mise à jour par `sudo pi-server update`.
                                               volume ◄── knob USB
 ```
 
-- **MASTER** est un périphérique virtuel (module PipeWire *combine-stream*). Il reçoit
-  tout et renvoie une copie vers **chaque sortie candidate présente**. Son volume est
-  le volume global, piloté par le knob.
+- **MASTER** est une sortie virtuelle simple (*null-audio-sink*). Elle reçoit tout ;
+  chaque **sortie** candidate en reçoit une copie par sa propre boucle
+  (*module-loopback*), reliée à l'appareil par `audio-hub links` dès qu'il apparaît et
+  déliée quand il part. Son volume (et la coupure) est le volume global, piloté par
+  le knob.
 - Chaque **entrée** candidate est raccordée en permanence à MASTER par une boucle
   (*module-loopback*). Pas de micro, donc pas de larsen ; la platine et le PC peuvent
   jouer en même temps (mixage).
@@ -154,7 +156,6 @@ sudo audio-hub status     # MASTER, entrées/sorties présentes, liens actifs
 | | `clock.quantum` (+ min/max) | taille de bloc ; augmenter si craquements |
 | | `resample.quality` | 0..14 |
 | | `master.initial-volume`, `master.max-volume` | volume au 1er démarrage, plafond du knob |
-| | `latency-compensate` | met HAT et DAC parfaitement en phase |
 | | `disable-unlisted` | désactive les appareils non listés |
 | `[knob]` | `device` | `auto` ou `/dev/input/by-id/usb-…-event-…` |
 | | `step`, `press`, `grab` | pas, action de l'appui (`mute`/`playpause`/`none`), capture exclusive |

@@ -28,9 +28,10 @@ c = ah.Config()
 
 # --- configuration générée : plus de lien automatique des boucles -----------------
 pw = ah.gen_pipewire(c)
-check(pw.count("node.autoconnect = false") == len([d for d in c.inputs if d.enabled]),
-      "chaque boucle d'entrée : node.autoconnect = false (pas de lien automatique)")
-check('target.object = "MASTER"' not in pw, "plus de target.object MASTER sur les boucles")
+check(pw.count("node.autoconnect = false") == len([d for d in c.inputs + c.outputs if d.enabled]),
+      "chaque boucle (entrées et sorties) : node.autoconnect = false (pas de lien automatique)")
+check(pw.count('target.object = "MASTER"') == len([d for d in c.outputs if d.enabled]),
+      "target.object MASTER : seulement sur la capture des boucles de sortie (moniteur), jamais vers MASTER")
 
 # --- faux graphe -------------------------------------------------------------------
 STATE = {}
@@ -137,7 +138,7 @@ d_dac = next(d for d in c.outputs if d.id == "dac")
 snap_objs = [
     {"id": 145, "type": "PipeWire:Interface:Device", "info": {"params": {"Profile": [{"name": "output:analog-stereo"}]}}},
     {"id": 118, "type": "PipeWire:Interface:Node", "info": {"state": "running", "props": {"node.name": "hub.out.dac", "device.id": 145}}},
-    {"id": 120, "type": "PipeWire:Interface:Node", "info": {"state": "running", "props": {"node.name": "output.MASTER_hub.out.dac"},
+    {"id": 120, "type": "PipeWire:Interface:Node", "info": {"state": "running", "props": {"node.name": "hub.master.dac.playback"},
                                                              "params": {"Props": [{"channelVolumes": [1.0, 1.0], "mute": False}]}}},
     {"id": 300, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 120, "input-node-id": 118}},
     {"id": 301, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 120, "input-node-id": 118}}]
@@ -167,6 +168,65 @@ check(ok and present == ["MASTER", "sorties amp", "Mopidy", "Bluetooth « %s »"
 ok, present, missing = ah.ready_check(c, [nd("MASTER"), nd("hub.out.amp")], dict(units, **{"mopidy.service": False}), False)
 check(not ok and missing == ["MASTER par défaut", "Mopidy", "Bluetooth"],
       "manques signalés : %s" % missing)
+
+print("== sorties : boucle MASTER -> appareil")
+OUT = {}
+
+
+def graph_out():
+    nodes, ports, links = {"MASTER": {"id": 1, "state": "running"}}, {}, []
+    pid = 5000
+    nid = 500
+    for o, st in OUT.items():
+        play = nid; nid += 10
+        nodes["hub.master.%s.playback" % o] = {"id": play, "state": "running"}
+        for ch in ("FL", "FR"):
+            ports[pid] = (play, "output_" + ch, "output"); pid += 1
+        if st["dev"]:
+            dev = nid; nid += 10
+            nodes["hub.out.%s" % o] = {"id": dev, "state": "running"}
+            for ch in st.get("chans", ("FL", "FR")):
+                ports[pid] = (dev, "playback_" + ch, "input"); pid += 1
+            if st["linked"]:
+                links.append((play, pid - 10, dev, pid - 1))
+                links.append((play, pid - 9, dev, pid - 2))
+        if st.get("wrong"):
+            links.append((play, 1, 1, 2))           # relié à MASTER : interdit
+    return nodes, ports, links
+
+
+ah.pw_graph = lambda c, objs=None: graph_out() if OUT else graph()
+STATE.clear()
+OUT.update({"amp": {"dev": True, "linked": False}, "dac": {"dev": False, "linked": False}})
+CMDS.clear(); ah.links_step(c)
+check([x for x in CMDS if x == ["pw-link", "hub.master.amp.playback:output_FL", "hub.out.amp:playback_FL"]]
+      and [x for x in CMDS if x == ["pw-link", "hub.master.amp.playback:output_FR", "hub.out.amp:playback_FR"]],
+      "amp présent : sa boucle est reliée FL->FL, FR->FR")
+check(not any("dac" in " ".join(x) for x in CMDS), "DAC absent : rien n'est relié")
+OUT["dac"] = {"dev": True, "linked": False, "chans": ("AUX0", "AUX1")}
+OUT["amp"]["linked"] = True
+CMDS.clear(); ah.links_step(c)
+check(CMDS == [["pw-link", "hub.master.dac.playback:output_FL", "hub.out.dac:playback_AUX0"],
+               ["pw-link", "hub.master.dac.playback:output_FR", "hub.out.dac:playback_AUX1"]],
+      "DAC revenu (profil pro-audio) : relié FL->AUX0, FR->AUX1 ; amp déjà relié, intact : %s" % CMDS)
+OUT["dac"] = {"dev": False, "linked": False, "wrong": True}
+CMDS.clear(); ah.links_step(c)
+check(CMDS == [["pw-link", "-d", "1", "2"]], "boucle d'une sortie reliée ailleurs (MASTER) : déliée aussitôt")
+OUT.clear()
+
+print("== sentinelle : PipeWire figé")
+clk = [0.0]
+hw = ah.HangWatch(clock=lambda: clk[0])
+check(not hw.step(False, True), "première absence de réponse : on attend")
+clk[0] = 30; check(not hw.step(False, True), "30 s : on attend encore")
+clk[0] = 61; check(hw.step(False, True), "plus de 60 s sans réponse : relance")
+clk[0] = 200; hw.step(False, True); clk[0] = 270
+check(not hw.step(False, True), "pas plus d'une relance toutes les 5 min")
+hw2 = ah.HangWatch(clock=lambda: clk[0])
+clk[0] = 0; hw2.step(False, False); clk[0] = 100
+check(not hw2.step(False, False), "PipeWire arrêté (systemd s'en charge) : pas de relance")
+clk[0] = 0; hw3 = ah.HangWatch(clock=lambda: clk[0]); hw3.step(False, True); clk[0] = 50; hw3.step(True, True); clk[0] = 90
+check(not hw3.step(False, True), "répond de nouveau entre-temps : compteur remis à zéro")
 
 print()
 print("%d échec(s)" % FAILS)
