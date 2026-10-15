@@ -151,16 +151,23 @@ w.feed(3, 0, lk(ADDR)); w.feed(3, 0, cc(ADDR, 12))
 clock[0] += 30
 check(w.feed(17, 0, cf(ADDR)) == [], "abandon trop tardif (30 s) : pas lié au jumelage, rien n'est coupé")
 
-print("== /etc/bluetooth/main.conf : ReverseServiceDiscovery = false")
-DEB = "[General]\n#Name = BlueZ\n#ReverseServiceDiscovery = true\n#FastConnectable = false\n\n[Policy]\n#ReverseServiceDiscovery = true\n"
+print("== /etc/bluetooth/main.conf")
+DEB = "[General]\n#Name = BlueZ\n#ReverseServiceDiscovery = true\n#FastConnectable = false\n\n[Policy]\n#ReverseServiceDiscovery = true\n#AutoEnable=true\n"
 out = ah.bluez_main_transform(DEB)
-check("[General]\n#Name = BlueZ\nReverseServiceDiscovery = false\n" in out and out.endswith("[Policy]\n#ReverseServiceDiscovery = true\n"),
-      "ligne commentée de [General] remplacée, autres sections intactes")
+check("[General]\n#Name = BlueZ\nReverseServiceDiscovery = false\n" in out,
+      "[General] ReverseServiceDiscovery = false (ligne commentée remplacée)")
+check(out.endswith("[Policy]\n#ReverseServiceDiscovery = true\nAutoEnable = false\n"),
+      "[Policy] AutoEnable = false, rien d'autre touché dans [Policy]")
 check(ah.bluez_main_transform(out) == out, "idempotent")
-check("[General]\nReverseServiceDiscovery = false\n#Name" in ah.bluez_main_transform("[General]\n#Name = x\n"),
-      "ligne absente : ajoutée sous [General]")
-check(ah.bluez_main_transform("[Policy]\n").endswith("[General]\nReverseServiceDiscovery = false\n"),
-      "section [General] absente : créée")
+out2 = ah.bluez_main_transform("[General]\n#Name = x\n")
+check("[General]\nReverseServiceDiscovery = false\n#Name" in out2 and out2.endswith("[Policy]\nAutoEnable = false\n"),
+      "lignes absentes : ajoutées, section [Policy] créée")
+
+print("== Bluetooth éteint tant que le serveur son n'est pas prêt")
+fm = FakeMgmt()
+ah.bt_controller_fix(fm, 0, power=False)
+check((ah.MGMT_SET_POWERED, 1) not in fm.calls and (ah.MGMT_SET_SSP, 0) in fm.calls,
+      "SSP coupé sans rallumer le contrôleur")
 
 print()
 print("%d échec(s)" % FAILS)

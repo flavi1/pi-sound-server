@@ -747,31 +747,40 @@ def cmd_generate(c, outdir):
 BLUEZ_MAIN_CONF = "/etc/bluetooth/main.conf"
 
 
-def bluez_main_transform(text):
-    """/etc/bluetooth/main.conf : ReverseServiceDiscovery = false dans [General].
-    Par défaut, bluetoothd n'autorise la connexion audio d'un téléphone de confiance
-    qu'après avoir lu la liste de ses services. Si cette lecture a échoué au jumelage
-    (cas du jumelage par code PIN rattrapé, voir plus bas), il l'attend indéfiniment :
-    connexion bloquée sur « Authorization pending », sans aucun message. Pour une
-    enceinte, cette liste ne sert à rien."""
-    want = "ReverseServiceDiscovery = false"
+def ini_set(text, section, key, value):
+    """Écrit « key = value » dans [section] d'un fichier INI (ligne existante, même
+    commentée, remplacée ; sinon ajoutée en tête de section ; section créée au besoin)."""
+    want = "%s = %s" % (key, value)
     lines = text.split("\n")
-    sec = None
-    general = None
+    sec, head = None, None
     for i, l in enumerate(lines):
         st = l.strip()
         if st.startswith("[") and st.endswith("]"):
             sec = st
-            if st == "[General]":
-                general = i
+            if st == "[%s]" % section:
+                head = i
             continue
-        if sec == "[General]" and re.match(r"^#?\s*ReverseServiceDiscovery\s*=", st):
+        if sec == "[%s]" % section and re.match(r"^#?\s*%s\s*=" % re.escape(key), st):
             lines[i] = want
             return "\n".join(lines)
-    if general is None:
-        return text.rstrip("\n") + "\n\n[General]\n" + want + "\n"
-    lines.insert(general + 1, want)
+    if head is None:
+        return text.rstrip("\n") + "\n\n[%s]\n%s\n" % (section, want)
+    lines.insert(head + 1, want)
     return "\n".join(lines)
+
+
+def bluez_main_transform(text):
+    """/etc/bluetooth/main.conf :
+    - [General] ReverseServiceDiscovery = false : par défaut, bluetoothd n'autorise la
+      connexion audio d'un téléphone de confiance qu'après avoir lu la liste de ses
+      services. Si cette lecture a échoué au jumelage (jumelage par code PIN rattrapé),
+      il l'attend indéfiniment : connexion bloquée sur « Authorization pending ». Pour
+      une enceinte, cette liste ne sert à rien.
+    - [Policy] AutoEnable = false : l'adaptateur reste éteint au démarrage ; c'est
+      audio-hub-bluetooth qui l'allume, une fois le serveur son prêt (un téléphone qui
+      se reconnecte trop tôt jouait parfois des « tocs » avant que MASTER soit en place)."""
+    text = ini_set(text, "General", "ReverseServiceDiscovery", "false")
+    return ini_set(text, "Policy", "AutoEnable", "false")
 
 
 def apply_bluetooth(c):
@@ -802,7 +811,7 @@ def apply_bluetooth(c):
         if new != old:
             with open(BLUEZ_MAIN_CONF, "w", encoding="utf-8") as f:
                 f.write(new)
-            log("  %s : ReverseServiceDiscovery = false" % BLUEZ_MAIN_CONF)
+            log("  %s : ReverseServiceDiscovery = false, AutoEnable = false" % BLUEZ_MAIN_CONF)
             sc("restart", "bluetooth.service")
     sc("enable", "--now", "bluetooth.service")
     sc("enable", BT_UNIT)
@@ -1692,16 +1701,18 @@ def hci_disconnect(index, handle, reason=0x13):
         os.close(fd)
 
 
-def bt_controller_fix(mgmt, index):
+def bt_controller_fix(mgmt, index, power=True):
     """SSP coupé (code PIN obligatoire) et classe « haut-parleur ». Le SSP ne peut être
-    désactivé que contrôleur éteint : extinction brève (une seule fois, au démarrage)."""
+    désactivé que contrôleur éteint : extinction brève (une seule fois, au démarrage).
+    power : rallumer le contrôleur ensuite (non tant que le serveur son n'est pas prêt)."""
     info = mgmt.info(index)
     if "ssp" in info["settings"]:
         log("hci%d : jumelage sans code (SSP) actif -> désactivé, code PIN obligatoire" % index)
         mgmt.set(MGMT_SET_POWERED, index, 0)
         mgmt.set(MGMT_SET_SC, index, 0)
         st = mgmt.set(MGMT_SET_SSP, index, 0)
-        mgmt.set(MGMT_SET_POWERED, index, 1)
+        if power:
+            mgmt.set(MGMT_SET_POWERED, index, 1)
         info = mgmt.info(index)
         if "ssp" in info["settings"]:
             log("hci%d : le contrôleur refuse de couper le SSP (statut %d) ; les jumelages "
@@ -1729,7 +1740,27 @@ def cmd_bluetooth(c):
     bus = dbus.SystemBus()
     PROPS = "org.freedesktop.DBus.Properties"
     pin, name, disc = c.bt["pin"], c.bt_name, yes(c.bt["discoverable"])
-    state = {"registered": False, "lost": False, "noadapter": False}
+    state = {"registered": False, "lost": False, "noadapter": False,
+             "audio_ready": False, "waiting": None}
+
+    def audio_ready():
+        """Le serveur son peut-il recevoir un téléphone ? MASTER présent et sortie par
+        défaut, au moins une sortie, initialisation terminée."""
+        if state["audio_ready"]:
+            return True
+        try:
+            objs = pw_dump(c) or []
+            init = (systemctl_user(c, "is-active", "audio-hub-init.service").stdout or "").strip() == "active"
+        except Exception:
+            objs, init = [], False
+        ok, _, missing = ready_check(c, objs, {"audio-hub-init.service": init}, None)
+        if ok:
+            state["audio_ready"] = True
+            log("serveur son prêt : Bluetooth allumé")
+        elif state["waiting"] != missing:
+            state["waiting"] = missing
+            log("Bluetooth éteint en attendant le serveur son (manque : %s)" % ", ".join(missing))
+        return ok
     try:
         mgmt = Mgmt()
     except OSError as ex:
@@ -1792,15 +1823,24 @@ def cmd_bluetooth(c):
                 state["noadapter"] = True
             return True
         state["noadapter"] = False
+        ready = audio_ready()
         for path in adapters:
             m = re.search(r"hci(\d+)$", str(path))
             if m:
                 try:
-                    bt_controller_fix(mgmt, int(m.group(1)))
+                    bt_controller_fix(mgmt, int(m.group(1)), power=ready)
                 except (OSError, TimeoutError) as ex:
                     log("contrôleur %s : %s" % (path, ex))
             cur = dbus.Interface(bus.get_object("org.bluez", path), PROPS).GetAll("org.bluez.Adapter1")
             ap = dbus.Interface(bus.get_object("org.bluez", path), PROPS)
+            if not ready:
+                # Ni visible ni joignable : un téléphone ne peut pas se (re)connecter
+                if cur.get("Powered"):
+                    try:
+                        ap.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(False))
+                    except dbus.DBusException as ex:
+                        log("adaptateur %s : extinction impossible (%s)" % (path, ex))
+                continue
             for k, v in (("Powered", dbus.Boolean(True)), ("Alias", dbus.String(name)),
                          ("PairableTimeout", dbus.UInt32(0)), ("Pairable", dbus.Boolean(True)),
                          ("DiscoverableTimeout", dbus.UInt32(0)),
@@ -1852,6 +1892,17 @@ def cmd_bluetooth(c):
     if mon is not None:
         GLib.io_add_watch(mon, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_monitor)
     reconcile()
+
+    def wait_audio():
+        # toutes les 3 s jusqu'à ce que le serveur son soit prêt, puis on rallume
+        if state["audio_ready"]:
+            return False
+        if audio_ready():
+            reconcile()
+            return False
+        return True
+
+    GLib.timeout_add_seconds(3, wait_audio)
     GLib.timeout_add_seconds(30, reconcile)
     loop.run()
     del agent

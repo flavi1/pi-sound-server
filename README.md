@@ -237,6 +237,14 @@ service le détecte (comme `btmon`) et coupe lui-même la connexion orpheline : 
 téléphone se reconnecte aussitôt avec la clé obtenue. Journal :
 `… connexion abandonnée par le noyau juste après le jumelage … coupée`.
 
+**Pas de connexion avant que le serveur son soit prêt.** Au démarrage, le Bluetooth de
+la Pi reste éteint (`AutoEnable = false` dans `/etc/bluetooth/main.conf`) :
+`audio-hub-bluetooth` ne l'allume que lorsque MASTER est en place et sortie par défaut,
+avec au moins une sortie. Un téléphone qui se reconnecte tout seul juste après le
+démarrage attend donc quelques secondes de plus, au lieu de jouer dans une pile audio
+pas encore prête (« tocs », silence). Journal : `Bluetooth éteint en attendant le
+serveur son…` puis `serveur son prêt : Bluetooth allumé`.
+
 Gérer les téléphones jumelés :
 
 ```bash
