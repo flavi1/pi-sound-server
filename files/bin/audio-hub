@@ -76,7 +76,7 @@ BOOT_DEFAULTS = {"manage": "yes", "file": "auto", "overlay": "iqaudio-dacplus,un
                  "disable-onboard-audio": "yes", "disable-hdmi-audio": "yes"}
 MOPIDY_DEFAULTS = {"enabled": "yes", "http.port": "6680", "mpd.port": "6600",
                    "media-dirs": "/media", "iris": "", "web": "rompr", "web.port": "80",
-                   "scan-interval-minutes": "60",
+                   "scan-interval-minutes": "60", "index": "no",
                    "extra-codecs": "no", "fixed-format": "no", "sink": "alsa"}
 # Bluetooth désactivé si la section est absente : ouvrir une interface radio doit
 # être un choix explicite (le modèle audio-hub.conf l'active).
@@ -491,6 +491,7 @@ def gen_mopidy(c):
     dirs = [x.strip() for x in m["media-dirs"].split(",") if x.strip()]
     file_dirs = "\n".join("    %s|%s" % (p, os.path.basename(p.rstrip("/")) or p) for p in dirs)
     iris = m["web"] == "iris"
+    local_on = "true" if yes(m["index"]) else "false"
     rompr = m["web"] == "rompr"
     excl = ".directory .html .jpeg .jpg .log .nfo .pdf .png .txt .zip .cue .m3u .db .ini .gif .bmp .webp"
     return (GEN_HEADER % c.path) + """[core]
@@ -527,7 +528,8 @@ show_dotfiles = false
 excluded_file_extensions = {excl}
 
 [local]
-enabled = true
+# Bibliothèque indexée (recherche par artiste / album) : [mopidy] index
+enabled = {local_on}
 media_dir = {local_dir}
 excluded_file_extensions = {excl}
 
@@ -536,7 +538,7 @@ enabled = true
 
 [stream]
 enabled = true
-{iris_sec}""".format(output=mopidy_output(c), http=m["http.port"], mpd=m["mpd.port"],
+{iris_sec}""".format(local_on=local_on, output=mopidy_output(c), http=m["http.port"], mpd=m["mpd.port"],
                      default_app="default_app = iris\n" if iris else "",
                      csrf=("# RompR (servi par nginx, autre port) appelle l'API HTTP de Mopidy depuis le\n"
                            "# navigateur. Réseau local uniquement (pare-feu).\n"
@@ -915,10 +917,11 @@ def cmd_apply(c):
     systemctl_user(c, "daemon-reload")
     knob = yes(c.knob["enabled"])
     mop = yes(c.mopidy["enabled"])
+    idx = mop and yes(c.mopidy["index"])
     systemctl_user(c, "enable", "pipewire.socket", "pipewire.service", "wireplumber.service",
                    "audio-hub-init.service", "audio-hub-links.service")
     for unit, on in (("audio-hub-knob.service", knob), ("mopidy.service", mop),
-                     ("mopidy-scan.timer", mop), ("mopidy-scan.path", mop)):
+                     ("mopidy-scan.timer", idx), ("mopidy-scan.path", idx)):
         if on:
             systemctl_user(c, "enable", unit)
         else:
@@ -932,7 +935,10 @@ def cmd_apply(c):
         systemctl_user(c, "restart", "audio-hub-knob.service")
     if mop:
         systemctl_user(c, "restart", "mopidy.service")
-        systemctl_user(c, "restart", "mopidy-scan.timer", "mopidy-scan.path")
+        if idx:
+            systemctl_user(c, "restart", "mopidy-scan.timer", "mopidy-scan.path")
+        else:
+            systemctl_user(c, "stop", "mopidy-scan.service")
     log("Bluetooth :")
     apply_bluetooth(c)
     if os.path.exists("/etc/systemd/system/" + READY_UNIT):

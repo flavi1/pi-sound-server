@@ -182,7 +182,8 @@ sudo audio-hub status     # MASTER, entrées/sorties présentes, liens actifs
 | `[input.<id>]` | mêmes clés + `gain-db` | gain de l'entrée dans MASTER, en dB (-40 à +24) : équilibrer platine / PC / Mopidy |
 | `[boot]` | `manage`, `file`, `overlay`, `disable-onboard-audio`, `disable-hdmi-audio` | config.txt (voir plus haut) |
 | `[bluetooth]` | `enabled`, `name`, `pin`, `discoverable` | enceinte Bluetooth (voir § Bluetooth) |
-| `[mopidy]` | `http.port`, `mpd.port`, `media-dirs`, `scan-interval-minutes` | |
+| `[mopidy]` | `http.port`, `mpd.port`, `media-dirs` | |
+| | `index`, `scan-interval-minutes` | bibliothèque indexée (`no` par défaut : navigation par dossiers) |
 | | `web`, `web.port` | interface web : `rompr` (défaut, port 80) / `iris` / `none` ; puis relancer `install.sh` |
 | | `sink`, `fixed-format` | sortie de Mopidy : `alsa` (défaut) / `pipewire` ; conversion préalable (déconseillée) — voir § Mopidy |
 | | `extra-codecs` | `no` : FLAC, MP3, OGG, Opus, WAV, AIFF. `yes` : + AAC/M4A/ALAC/WMA (ffmpeg, ≈ 300 Mo), puis relancer `install.sh` |
@@ -287,12 +288,12 @@ rejumeler avec le code.
   celui de Mopidy seul ; le knob règle MASTER (toutes les sources).
   MPD : `hifi.local:6600` (M.A.L.P., Cantata, ncmpcpp…).
   Iris reste disponible : `web = iris` dans `[mopidy]` puis `install.sh`.
-- Bibliothèque : backend **file** (navigation directe dans `/media`, toujours à jour) et
-  **local** (recherche par artiste/album).
-- Réindexation : une unité systemd *path* surveille `/media` ; dès qu'un dossier y
-  apparaît ou disparaît (disque branché/débranché), la bibliothèque est réindexée, et
-  aussi toutes les `scan-interval-minutes`. Peu importe ce qui remplit `/media`
-  (pi-data-server, fstab, montage manuel) : aucun lien avec un autre module.
+- Bibliothèque : backend **file**, navigation directe dans les dossiers de `/media`,
+  toujours à jour, **sans indexation** (`index = no`, défaut).
+- `index = yes` : en plus, bibliothèque indexée (Mopidy-Local, recherche par artiste /
+  album) ; une unité systemd *path* surveille `/media` et réindexe à chaque disque
+  branché / débranché, et toutes les `scan-interval-minutes`. Longue sur une grande
+  bibliothèque.
 - Sortie (`sink = alsa`, défaut) : sortie ALSA de PipeWire vers la sortie par défaut,
   MASTER. Quand le format change d'un morceau à l'autre (44,1 → 96 kHz, 16 → 24
   bits…), elle est refermée puis rouverte au nouveau format : **court silence entre
@@ -445,4 +446,4 @@ Autres points :
 | Bluetooth : le téléphone ne demande pas de code, ou échoue à se jumeler | `sudo journalctl -u audio-hub-bluetooth -b` ; s'il était déjà jumelé : l'oublier des deux côtés et recommencer |
 | Bluetooth : code et jumelage OK, mais la connexion n'aboutit jamais (téléphone déjà associé ou non) | `bluetoothd` attendait la liste des services du téléphone, jamais lue : `audio-hub apply` règle `ReverseServiceDiscovery = false` dans `/etc/bluetooth/main.conf` ; vérifier `grep ReverseServiceDiscovery /etc/bluetooth/main.conf` |
 | Bluetooth : connecté mais pas de son | `sudo audio-hub status` (section BLUETOOTH) ; le flux doit être relié à MASTER : `pw-link -l` ; supprimer un ancien `~hifi/.config/wireplumber/wireplumber.conf.d/60-bluetooth.conf` réglé à la main |
-| Mopidy ne voit pas un disque | `sudo systemctl --user -M hifi@ start mopidy-scan`, `sudo journalctl _UID=$(id -u hifi) --user-unit=mopidy-scan` |
+| Mopidy ne voit pas un disque | navigation par dossiers : le disque doit être monté dans `/media` (`ls /media`) ; avec `index = yes` : `sudo systemctl --user -M hifi@ start --no-block mopidy-scan`, `sudo journalctl -f _SYSTEMD_USER_UNIT=mopidy-scan.service` |
