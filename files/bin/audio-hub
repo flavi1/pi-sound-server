@@ -75,7 +75,8 @@ KNOB_DEFAULTS = {"enabled": "yes", "device": "auto", "step": "0.02", "press": "m
 BOOT_DEFAULTS = {"manage": "yes", "file": "auto", "overlay": "iqaudio-dacplus,unmute_amp",
                  "disable-onboard-audio": "yes", "disable-hdmi-audio": "yes"}
 MOPIDY_DEFAULTS = {"enabled": "yes", "http.port": "6680", "mpd.port": "6600",
-                   "media-dirs": "/media", "iris": "yes", "scan-interval-minutes": "60",
+                   "media-dirs": "/media", "iris": "", "web": "rompr", "web.port": "80",
+                   "scan-interval-minutes": "60",
                    "extra-codecs": "no", "fixed-format": "no", "sink": "alsa"}
 # Bluetooth désactivé si la section est absente : ouvrir une interface radio doit
 # être un choix explicite (le modèle audio-hub.conf l'active).
@@ -189,6 +190,10 @@ class Config:
                 die("[global] %s doit être un entier" % k)
         if not re.fullmatch(r"[0-9]{4,16}", self.bt["pin"]):
             die("[bluetooth] pin doit compter 4 à 16 chiffres (ex. 1234)")
+        if self.mopidy["web"] not in ("rompr", "iris", "none"):
+            die("[mopidy] web doit valoir rompr, iris ou none")
+        if not self.mopidy["web.port"].isdigit():
+            die("[mopidy] web.port doit être un entier")
         if self.mopidy["sink"] not in ("alsa", "pipewire"):
             die("[mopidy] sink doit valoir alsa ou pipewire")
         if not self.bt["name"]:
@@ -485,7 +490,8 @@ def gen_mopidy(c):
     m = c.mopidy
     dirs = [x.strip() for x in m["media-dirs"].split(",") if x.strip()]
     file_dirs = "\n".join("    %s|%s" % (p, os.path.basename(p.rstrip("/")) or p) for p in dirs)
-    iris = yes(m["iris"])
+    iris = m["web"] == "iris"
+    rompr = m["web"] == "rompr"
     excl = ".directory .html .jpeg .jpg .log .nfo .pdf .png .txt .zip .cue .m3u .db .ini .gif .bmp .webp"
     return (GEN_HEADER % c.path) + """[core]
 restore_state = true
@@ -504,11 +510,13 @@ mixer_volume = 100
 enabled = true
 hostname = ::
 port = {http}
-{default_app}
+{default_app}{csrf}
 [mpd]
 enabled = true
 hostname = ::
 port = {mpd}
+# RompR garde de longues connexions MPD ouvertes (minimum conseillé : 120 s)
+connection_timeout = 600
 
 [file]
 enabled = true
@@ -530,6 +538,9 @@ enabled = true
 enabled = true
 {iris_sec}""".format(output=mopidy_output(c), http=m["http.port"], mpd=m["mpd.port"],
                      default_app="default_app = iris\n" if iris else "",
+                     csrf=("# RompR (servi par nginx, autre port) appelle l'API HTTP de Mopidy depuis le\n"
+                           "# navigateur. Réseau local uniquement (pare-feu).\n"
+                           "csrf_protection = false\n") if rompr else "",
                      file_dirs=file_dirs, excl=excl, local_dir=dirs[0] if dirs else "/media",
                      iris_sec="\n[iris]\ncountry = FR\nlocale = fr_FR\n" if iris else "")
 
@@ -785,7 +796,10 @@ def cmd_check(c):
     if yes(c.g["latency-compensate"]):
         print("  (latency-compensate ignoré : plus de compensation de latence entre sorties)")
     print("  knob         : %s (%s)" % ("actif" if yes(c.knob["enabled"]) else "inactif", c.knob["device"]))
-    print("  mopidy       : %s" % ("actif" if yes(c.mopidy["enabled"]) else "inactif"))
+    print("  mopidy       : %s, interface web : %s" % (
+        "actif" if yes(c.mopidy["enabled"]) else "inactif",
+        {"rompr": "RompR (port %s)" % c.mopidy["web.port"], "iris": "Iris (port %s)" % c.mopidy["http.port"],
+         "none": "aucune"}[c.mopidy["web"]]))
     if c.bt_enabled:
         print("  bluetooth    : actif, nom « %s », code PIN %s, %s" % (
             c.bt_name, c.bt["pin"], "visible" if yes(c.bt["discoverable"]) else "invisible"))

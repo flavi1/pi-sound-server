@@ -101,7 +101,8 @@ install -m 755 "$F/bin/audio-hub-diag" /usr/local/bin/audio-hub-diag
 AUSER="$(ini global user)"; AUSER="${AUSER:-hifi}"
 HP="$(ini mopidy http.port)"; HP="${HP:-6680}"
 MP="$(ini mopidy mpd.port)";  MP="${MP:-6600}"
-IRIS="$(ini mopidy iris)"
+WEB="$(ini mopidy web)"; WEB="${WEB:-rompr}"
+WEBPORT="$(ini mopidy web.port)"; WEBPORT="${WEBPORT:-80}"
 CODECS="$(ini mopidy extra-codecs)"; CODECS="${CODECS:-no}"
 BT="$(ini bluetooth enabled)"; BT="${BT:-no}"
 
@@ -110,6 +111,7 @@ log "Paquets PipeWire / Mopidy"
 # Espace libre : PipeWire + Mopidy ≈ 250 Mo, + ≈ 300 Mo si codecs supplémentaires
 NEED_MB=400
 [[ "${CODECS,,}" =~ ^(yes|true|1|on|oui)$ ]] && NEED_MB=750
+[[ "$WEB" == rompr ]] && NEED_MB=$((NEED_MB + 60))
 FREE_MB="$(df -Pm / | awk 'NR==2 {print $4}')"
 if (( FREE_MB < NEED_MB )); then
     warn "Espace libre insuffisant sur / : ${FREE_MB} Mo, il en faut environ ${NEED_MB}."
@@ -154,13 +156,67 @@ systemctl disable --now mopidy.service 2>/dev/null || true
 systemctl mask mopidy.service 2>/dev/null || true
 mkdir -p /media
 
-if [[ "${IRIS,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
+if [[ "$WEB" == iris ]]; then
     log "Interface web Iris (pip)"
     apt_run install python3-pip python3-setuptools python3-pykka
     # --no-deps : pip ne doit JAMAIS remplacer le Mopidy de Debian par celui de PyPI
     # (Iris demande seulement Mopidy >= 3.0, déjà fourni par apt).
     pip3 install --break-system-packages --root-user-action=ignore --no-deps --upgrade "Mopidy-Iris>=3.69,<4" \
         || warn "Iris non installé (Mopidy reste pilotable en MPD : port $MP)"
+elif pip3 show Mopidy-Iris >/dev/null 2>&1; then
+    log "Retrait d'Iris (interface web : $WEB)"
+    pip3 uninstall -y --break-system-packages --root-user-action=ignore Mopidy-Iris || true
+fi
+
+# --- RompR : interface web PHP (nginx + PHP-FPM), dernière version publiée ---------
+ROMPR_WEB=/var/www/rompr-web
+if [[ "$WEB" == rompr ]]; then
+    log "Interface web RompR (nginx + PHP)"
+    apt_run install nginx php-fpm php-curl php-xml php-mbstring php-sqlite3 php-gd php-intl curl
+    REL="$(curl -fsSL --max-time 30 https://api.github.com/repos/fatg3erman/RompR/releases/latest || true)"
+    TAG="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' <<<"$REL" 2>/dev/null || true)"
+    URL="$(python3 -c 'import json,sys
+d = json.load(sys.stdin)
+z = [a["browser_download_url"] for a in d.get("assets", []) if a["name"].endswith(".zip")]
+print(z[0] if z else d["zipball_url"])' <<<"$REL" 2>/dev/null || true)"
+    mkdir -p "$ROMPR_WEB"
+    if [[ -z "$TAG" || -z "$URL" ]]; then
+        warn "Dernière version de RompR introuvable (GitHub injoignable ?) : version installée conservée"
+    elif [[ "$(cat "$ROMPR_WEB/.rompr-version" 2>/dev/null)" != "$TAG" ]]; then
+        TMPR="$(mktemp -d)"
+        if curl -fsSL --max-time 300 -o "$TMPR/rompr.zip" "$URL" && python3 -m zipfile -e "$TMPR/rompr.zip" "$TMPR/x"; then
+            # le index.php le moins profond = racine de RompR (« rompr/ » ou dossier du dépôt)
+            SRC="$(dirname "$(find "$TMPR/x" -maxdepth 3 -name index.php | awk -F/ '{print NF" "$0}' | sort -n | head -1 | cut -d' ' -f2-)")"
+            if [[ -f "$SRC/index.php" ]]; then
+                mkdir -p "$ROMPR_WEB/rompr"
+                # préférences et pochettes conservées d'une version à l'autre
+                tar -C "$SRC" --exclude=./prefs --exclude=./albumart -cf - . | tar -C "$ROMPR_WEB/rompr" -xf -
+                echo "$TAG" > "$ROMPR_WEB/.rompr-version"
+                log "RompR $TAG installé"
+            else
+                warn "Archive RompR inattendue : version installée conservée"
+            fi
+        else
+            warn "Téléchargement de RompR impossible : version installée conservée"
+        fi
+        rm -rf "$TMPR"
+    fi
+    mkdir -p "$ROMPR_WEB/rompr/prefs" "$ROMPR_WEB/rompr/albumart"
+    chown -R www-data:www-data "$ROMPR_WEB/rompr/prefs" "$ROMPR_WEB/rompr/albumart"
+    for d in /etc/php/*/fpm/conf.d; do
+        [[ -d "$d" ]] && install -m 644 "$F/rompr-php.ini" "$d/99-rompr.ini"
+    done
+    sed -e "s#@PORT@#$WEBPORT#g" -e "s#@ROOT@#$ROMPR_WEB#g" "$F/rompr-nginx.conf.in" > /etc/nginx/sites-available/rompr
+    ln -sf /etc/nginx/sites-available/rompr /etc/nginx/sites-enabled/rompr
+    rm -f /etc/nginx/sites-enabled/default
+    nginx -t && systemctl enable nginx && systemctl restart nginx
+    for u in /lib/systemd/system/php*-fpm.service; do
+        [[ -f "$u" ]] && systemctl enable "$(basename "$u")" && systemctl restart "$(basename "$u")"
+    done
+elif [[ -f /etc/nginx/sites-enabled/rompr ]]; then
+    log "RompR désactivé (interface web : $WEB)"
+    rm -f /etc/nginx/sites-enabled/rompr
+    systemctl reload nginx 2>/dev/null || true
 fi
 
 # Python 3.13 n'a plus le module imghdr, encore utilisé par Mopidy-Local (recherche
@@ -190,11 +246,13 @@ systemctl enable audio-hub-ready.service
 
 # --- Pare-feu (seulement si un pare-feu pi-server est en place) ----------------------
 if [[ -f /etc/nftables.d/00-lan.nft ]] && grep -q 'nftables.d/\[1-9\]' /etc/nftables.conf 2>/dev/null; then
-    log "Pare-feu : Mopidy (HTTP $HP + MPD $MP) limité au réseau local"
+    PORTS="$HP, $MP"
+    [[ "$WEB" == rompr ]] && PORTS="$PORTS, $WEBPORT"
+    log "Pare-feu : Mopidy / interface web (ports $PORTS) limités au réseau local"
     cat > /etc/nftables.d/20-pi-sound-server.nft <<EOF
 # pi-sound-server — réseau local uniquement
-add rule inet filter input ip  saddr \$LAN4 tcp dport { $HP, $MP } accept
-add rule inet filter input ip6 saddr \$LAN6 tcp dport { $HP, $MP } accept
+add rule inet filter input ip  saddr \$LAN4 tcp dport { $PORTS } accept
+add rule inet filter input ip6 saddr \$LAN6 tcp dport { $PORTS } accept
 EOF
     nft -c -f /etc/nftables.conf && systemctl restart nftables
     if systemctl is-active --quiet fail2ban; then systemctl restart fail2ban; fi
@@ -224,5 +282,9 @@ cat <<EOF
   Configuration unique : $CONF   puis  sudo audio-hub apply
   Appareils détectés   : sudo audio-hub list
   État du routage      : sudo audio-hub status
-  Mopidy               : http://$IP:$HP/  (MPD : port $MP)
+  Mopidy               : MPD sur le port $MP, API HTTP sur le port $HP
 EOF
+case "$WEB" in
+    rompr) echo "  Interface web        : http://$IP$( [[ "$WEBPORT" == 80 ]] || echo ":$WEBPORT")/rompr/  (RompR)" ;;
+    iris)  echo "  Interface web        : http://$IP:$HP/  (Iris)" ;;
+esac

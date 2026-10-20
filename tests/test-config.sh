@@ -47,7 +47,16 @@ import configparser, sys
 c = configparser.ConfigParser(interpolation=None); c.read(sys.argv[1])
 out = c["audio"]["output"]
 assert out == "alsasink device=pipewire", "sortie Mopidy par défaut : %s" % out
+assert c["http"]["csrf_protection"] == "false", "RompR : API HTTP accessible au navigateur"
+assert int(c["mpd"]["connection_timeout"]) >= 120, "RompR : connection_timeout MPD"
+assert "iris" not in c and "default_app" not in c["http"], "Iris absent"
 PY
+sed 's/^web = rompr/web = iris/' "$AUDIO_HUB_CONF" > "$W/iris.conf"
+AUDIO_HUB_CONF="$W/iris.conf" "${HUB[@]}" generate "$W/gen-iris" >/dev/null
+grep -q '^default_app = iris' "$W/gen-iris/.config/mopidy/mopidy.conf" && ! grep -q csrf_protection "$W/gen-iris/.config/mopidy/mopidy.conf" \
+    && ok "web = iris : Iris par défaut, protection CSRF conservée" || fail "web = iris"
+printf '[mopidy]\nweb = ampache\n' > "$W/badweb.conf"
+AUDIO_HUB_CONF="$W/badweb.conf" "${HUB[@]}" check >/dev/null 2>&1 && fail "web = ampache accepté" || ok "interface web inconnue refusée"
 sed -e 's/^fixed-format = no/fixed-format = yes/' -e 's/^sink = alsa/sink = pipewire/' "$AUDIO_HUB_CONF" > "$W/fix.conf"
 AUDIO_HUB_CONF="$W/fix.conf" "${HUB[@]}" generate "$W/gen-fix" >/dev/null
 grep -q '^output = audioconvert ! audioresample quality=10 ! audio/x-raw,format=F32LE,rate=192000,channels=2 ! pipewiresink target-object=MASTER' \

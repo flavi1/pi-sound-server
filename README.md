@@ -79,7 +79,8 @@ sudo bash /opt/pi-sound-server/install.sh
 sudo reboot        # nécessaire la première fois (HAT activé dans config.txt)
 ```
 
-Le script installe PipeWire, WirePlumber, Mopidy (+ mopidy-local, mopidy-mpd, Iris via
+Le script installe PipeWire, WirePlumber, Mopidy (+ mopidy-local, mopidy-mpd, l'interface
+web RompR avec nginx et PHP — ou Iris via
 pip), crée l'utilisateur `hifi` (groupes `audio`, `input`), active le *linger* (sa
 session systemd démarre au boot sans connexion), installe la config par défaut puis
 lance `audio-hub apply`. Sans pare-feu pi-server, il prévient que les ports Mopidy ne
@@ -181,7 +182,8 @@ sudo audio-hub status     # MASTER, entrées/sorties présentes, liens actifs
 | `[input.<id>]` | mêmes clés + `gain-db` | gain de l'entrée dans MASTER, en dB (-40 à +24) : équilibrer platine / PC / Mopidy |
 | `[boot]` | `manage`, `file`, `overlay`, `disable-onboard-audio`, `disable-hdmi-audio` | config.txt (voir plus haut) |
 | `[bluetooth]` | `enabled`, `name`, `pin`, `discoverable` | enceinte Bluetooth (voir § Bluetooth) |
-| `[mopidy]` | `http.port`, `mpd.port`, `media-dirs`, `iris`, `scan-interval-minutes` | |
+| `[mopidy]` | `http.port`, `mpd.port`, `media-dirs`, `scan-interval-minutes` | |
+| | `web`, `web.port` | interface web : `rompr` (défaut, port 80) / `iris` / `none` ; puis relancer `install.sh` |
 | | `sink`, `fixed-format` | sortie de Mopidy : `alsa` (défaut) / `pipewire` ; conversion préalable (déconseillée) — voir § Mopidy |
 | | `extra-codecs` | `no` : FLAC, MP3, OGG, Opus, WAV, AIFF. `yes` : + AAC/M4A/ALAC/WMA (ffmpeg, ≈ 300 Mo), puis relancer `install.sh` |
 
@@ -276,7 +278,11 @@ rejumeler avec le code.
 
 ## 4. Mopidy
 
-- Web : `http://hifi.local:6680/` (Iris) ; MPD : `hifi.local:6600` (MALP, Cantata, ncmpcpp…).
+- Web : **RompR**, `http://hifi.local/rompr/` (nginx + PHP, dernière version publiée,
+  mise à jour avec `pi-server update` ; préférences et pochettes conservées). Au
+  premier lancement, RompR demande le lecteur : **Mopidy**, hôte `localhost`, port MPD
+  `6600`, port HTTP `6680`. MPD : `hifi.local:6600` (M.A.L.P., Cantata, ncmpcpp…).
+  Iris reste disponible : `web = iris` dans `[mopidy]` puis `install.sh`.
 - Bibliothèque : backend **file** (navigation directe dans `/media`, toujours à jour) et
   **local** (recherche par artiste/album).
 - Réindexation : une unité systemd *path* surveille `/media` ; dès qu'un dossier y
@@ -324,7 +330,7 @@ cat /proc/asound/card*/pcm0p/sub0/hw_params   # idem pour le HAT (rate: 192000 a
 ## 6. Recette (à faire une fois après installation)
 
 1. `sudo audio-hub status` : MASTER présent, `amp` PRÉSENTE, liens `MASTER → hub.out.amp`.
-2. Lire un fichier depuis Iris : son sur le HAT.
+2. Lire un fichier depuis RompR : son sur le HAT.
 3. Allumer le DAC : il apparaît dans `status` et joue en même temps, sans coupure du HAT.
 4. Éteindre le DAC en pleine lecture : le HAT continue.
 5. Poser le diamant : la platine sort sur toutes les sorties ; `hw_params` / `stream0`
