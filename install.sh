@@ -163,6 +163,15 @@ if [[ "${IRIS,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
         || warn "Iris non installé (Mopidy reste pilotable en MPD : port $MP)"
 fi
 
+# Python 3.13 n'a plus le module imghdr, encore utilisé par Mopidy-Local (recherche
+# par artiste / album) : rétroportage officiel « standard-imghdr ».
+if ! python3 -c 'import imghdr' 2>/dev/null; then
+    log "Module imghdr pour Mopidy-Local (Python 3.13+)"
+    apt_run install python3-pip
+    pip3 install --break-system-packages --root-user-action=ignore standard-imghdr \
+        || warn "standard-imghdr non installé : Mopidy-Local (recherche) désactivé"
+fi
+
 # --- Unités utilisateur ----------------------------------------------------------
 log "Services utilisateur"
 UHOME="$(getent passwd "$AUSER" | cut -d: -f6)"
