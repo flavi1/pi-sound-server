@@ -46,14 +46,14 @@ python3 - "$W/gen/.config/mopidy/mopidy.conf" <<'PY' && ok "mopidy.conf lisible"
 import configparser, sys
 c = configparser.ConfigParser(interpolation=None); c.read(sys.argv[1])
 out = c["audio"]["output"]
-assert out.endswith("pipewiresink target-object=MASTER client-name=Mopidy"), "sortie Mopidy"
-assert "audio/x-raw,format=F32LE,rate=192000,channels=2" in out, "format fixe Mopidy"
-assert "audioresample quality=10" in out, "qualité du rééchantillonnage"
+assert out == "alsasink device=pipewire", "sortie Mopidy par défaut : %s" % out
 PY
-sed 's/^fixed-format = yes/fixed-format = no/' "$AUDIO_HUB_CONF" > "$W/nofix.conf"
-AUDIO_HUB_CONF="$W/nofix.conf" "${HUB[@]}" generate "$W/gen-nofix" >/dev/null
-grep -q '^output = pipewiresink target-object=MASTER' "$W/gen-nofix/.config/mopidy/mopidy.conf" \
-    && ok "fixed-format = no : sortie directe" || fail "fixed-format = no"
+sed -e 's/^fixed-format = no/fixed-format = yes/' -e 's/^sink = alsa/sink = pipewire/' "$AUDIO_HUB_CONF" > "$W/fix.conf"
+AUDIO_HUB_CONF="$W/fix.conf" "${HUB[@]}" generate "$W/gen-fix" >/dev/null
+grep -q '^output = audioconvert ! audioresample quality=10 ! audio/x-raw,format=F32LE,rate=192000,channels=2 ! pipewiresink target-object=MASTER' \
+    "$W/gen-fix/.config/mopidy/mopidy.conf" && ok "sink = pipewire + fixed-format = yes : ancienne chaîne" || fail "sink pipewire / fixed-format"
+printf '[mopidy]\nsink = pulse\n' > "$W/badsink.conf"
+AUDIO_HUB_CONF="$W/badsink.conf" "${HUB[@]}" check >/dev/null 2>&1 && fail "sink = pulse accepté" || ok "sink inconnu refusé"
 
 echo "== Bluetooth"
 BTW="$W/gen/.config/wireplumber/wireplumber.conf.d/51-audio-hub-bluetooth.conf"

@@ -76,7 +76,7 @@ BOOT_DEFAULTS = {"manage": "yes", "file": "auto", "overlay": "iqaudio-dacplus,un
                  "disable-onboard-audio": "yes", "disable-hdmi-audio": "yes"}
 MOPIDY_DEFAULTS = {"enabled": "yes", "http.port": "6680", "mpd.port": "6600",
                    "media-dirs": "/media", "iris": "yes", "scan-interval-minutes": "60",
-                   "extra-codecs": "no", "fixed-format": "yes"}
+                   "extra-codecs": "no", "fixed-format": "no", "sink": "alsa"}
 # Bluetooth désactivé si la section est absente : ouvrir une interface radio doit
 # être un choix explicite (le modèle audio-hub.conf l'active).
 BT_DEFAULTS = {"enabled": "no", "name": "auto", "pin": "1234", "discoverable": "yes"}
@@ -189,6 +189,8 @@ class Config:
                 die("[global] %s doit être un entier" % k)
         if not re.fullmatch(r"[0-9]{4,16}", self.bt["pin"]):
             die("[bluetooth] pin doit compter 4 à 16 chiffres (ex. 1234)")
+        if self.mopidy["sink"] not in ("alsa", "pipewire"):
+            die("[mopidy] sink doit valoir alsa ou pipewire")
         if not self.bt["name"]:
             die("[bluetooth] name ne peut pas être vide (auto = nom de la machine)")
         self.allowed_rates = [int(x) for x in re.split(r"[\s,]+", self.g["clock.allowed-rates"].strip()) if x]
@@ -458,12 +460,20 @@ def gen_wireplumber_bt(c):
 
 
 def mopidy_output(c):
-    """Sortie GStreamer de Mopidy. Avec fixed-format (défaut), tout morceau est converti
-    en flottant 32 bits stéréo à la fréquence de MASTER AVANT pipewiresink : la sortie
-    ne change jamais de format d'un morceau à l'autre. Sans cela, l'enchaînement sans
-    blanc entre deux fichiers de fréquence ou de format différents fait parfois
-    renégocier pipewiresink en pleine lecture : son haché et suraigu, ou souffle."""
-    sink = "pipewiresink target-object=%s client-name=Mopidy" % c.master
+    """Sortie GStreamer de Mopidy.
+    sink = alsa (défaut) : sortie ALSA de PipeWire vers la sortie par défaut (MASTER).
+      Au changement de format entre deux morceaux (44,1 -> 96 kHz, 16 -> 24 bits…),
+      elle est refermée puis rouverte au nouveau format : court silence, jamais de
+      renégociation en pleine lecture. Deux morceaux de même format restent enchaînés
+      sans blanc. PipeWire convertit vers MASTER (qualité resample.quality).
+    sink = pipewire : pipewiresink. Renégocie mal en pleine lecture (son haché et
+      suraigu, souffle) ; avec fixed-format, rafales sur les fichiers 44,1 kHz.
+    fixed-format = yes : conversion par GStreamer en F32 à la fréquence de MASTER avant
+      la sortie (déconseillé, voir ci-dessus)."""
+    if c.mopidy["sink"] == "alsa":
+        sink = "alsasink device=pipewire"
+    else:
+        sink = "pipewiresink target-object=%s client-name=Mopidy" % c.master
     if not yes(c.mopidy["fixed-format"]):
         return sink
     q = min(10, int(c.g["resample.quality"]))      # 10 = maximum de GStreamer
@@ -485,7 +495,7 @@ verbosity = 0
 
 [audio]
 # Mopidy joue dans MASTER, qui distribue vers toutes les sorties
-# (format fixe : [mopidy] fixed-format dans audio-hub.conf)
+# (sortie et format : [mopidy] sink / fixed-format dans audio-hub.conf)
 output = {output}
 mixer = software
 mixer_volume = 100
