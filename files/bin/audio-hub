@@ -793,6 +793,9 @@ def cmd_check(c):
         print("  sortie %-12s -> %-22s %s %s" % (d.id, d.node_name, "" if d.enabled else "[désactivée]", d.match))
     for d in c.inputs:
         print("  entrée %-12s -> %-22s %s %s" % (d.id, d.node_name, "" if d.enabled else "[désactivée]", d.match))
+    if c.mopidy["web"] == "rompr" and (c.mopidy["mpd.port"], c.mopidy["http.port"]) != ("6600", "6680"):
+        print("  ATTENTION : RompR ne se configure tout seul qu'avec mpd.port = 6600 et http.port = 6680 "
+              "(sinon : http://<pi>/rompr/?setup)")
     if yes(c.g["latency-compensate"]):
         print("  (latency-compensate ignoré : plus de compensation de latence entre sorties)")
     print("  knob         : %s (%s)" % ("actif" if yes(c.knob["enabled"]) else "inactif", c.knob["device"]))

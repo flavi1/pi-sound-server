@@ -279,9 +279,13 @@ rejumeler avec le code.
 ## 4. Mopidy
 
 - Web : **RompR**, `http://hifi.local/rompr/` (nginx + PHP, dernière version publiée,
-  mise à jour avec `pi-server update` ; préférences et pochettes conservées). Au
-  premier lancement, RompR demande le lecteur : **Mopidy**, hôte `localhost`, port MPD
-  `6600`, port HTTP `6680`. MPD : `hifi.local:6600` (M.A.L.P., Cantata, ncmpcpp…).
+  mise à jour avec `pi-server update` ; préférences et pochettes conservées). **Aucun
+  réglage à faire** : RompR se connecte par défaut au lecteur MPD `localhost:6600` et
+  détecte seul l'API HTTP de Mopidy sur le port `6680` (ports à laisser tels quels ;
+  sinon `http://hifi.local/rompr/?setup`). RompR n'est qu'une télécommande : le son
+  reste produit par Mopidy, avec sa sortie et son format. Son curseur de volume est
+  celui de Mopidy seul ; le knob règle MASTER (toutes les sources).
+  MPD : `hifi.local:6600` (M.A.L.P., Cantata, ncmpcpp…).
   Iris reste disponible : `web = iris` dans `[mopidy]` puis `install.sh`.
 - Bibliothèque : backend **file** (navigation directe dans `/media`, toujours à jour) et
   **local** (recherche par artiste/album).
