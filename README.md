@@ -304,6 +304,16 @@ rejumeler avec le code.
   « tatatata » sur les fichiers 44,1 kHz : déconseillé.
 - Accessible uniquement depuis le réseau local (pare-feu).
 
+### Site web de la Pi (`www/`)
+
+`http://hifi.local/` sert le dossier **`www/`** du dépôt (nginx + PHP-FPM), copié tel
+quel dans `/var/www/hifi` à chaque installation / mise à jour : y placer `index.php`,
+HTML, CSS… et pousser sur git. Ce qui disparaît du dépôt disparaît du site. Les
+fichiers appartiennent à root (le site ne peut pas modifier son propre code) ; les
+fichiers cachés (`.git`, `.env`…) ne sont jamais servis. Par défaut, une page
+d'accueil renvoie vers RompR (`/rompr/`) et les fichiers (`:8080`). Réseau local
+uniquement (pare-feu), port `[mopidy] web.port` (80).
+
 ## 5. Commandes utiles
 
 **Serveur son prêt ?** Au démarrage (et après chaque `audio-hub apply`), le service

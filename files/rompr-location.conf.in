@@ -1,23 +1,10 @@
-# Généré par pi-sound-server/install.sh : interface web RompR (Mopidy)
-# http://<pi>/rompr/   — réseau local uniquement (pare-feu pi-server)
-server {
-    listen @PORT@ default_server;
-    listen [::]:@PORT@ default_server;
-    server_name _;
-    root @ROOT@;
-    index index.php index.html;
-    client_max_body_size 256M;
-
-    location = / {
-        return 302 /rompr/;
-    }
-
-    location /rompr/ {
+    # RompR (dernière version publiée, dans @ROMPR_ROOT@/rompr)
+    location ^~ /rompr/ {
+        root @ROMPR_ROOT@;
         index index.php;
         location ~ \.php$ {
             try_files $uri =404;
             fastcgi_pass unix:/run/php/php-fpm.sock;
-            fastcgi_index index.php;
             include fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
             fastcgi_read_timeout 1800;
@@ -28,4 +15,3 @@ server {
             expires -1s;
         }
     }
-}

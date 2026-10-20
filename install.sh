@@ -111,7 +111,7 @@ log "Paquets PipeWire / Mopidy"
 # Espace libre : PipeWire + Mopidy ≈ 250 Mo, + ≈ 300 Mo si codecs supplémentaires
 NEED_MB=400
 [[ "${CODECS,,}" =~ ^(yes|true|1|on|oui)$ ]] && NEED_MB=750
-[[ "$WEB" == rompr ]] && NEED_MB=$((NEED_MB + 60))
+NEED_MB=$((NEED_MB + 60))   # nginx + PHP (+ RompR)
 FREE_MB="$(df -Pm / | awk 'NR==2 {print $4}')"
 if (( FREE_MB < NEED_MB )); then
     warn "Espace libre insuffisant sur / : ${FREE_MB} Mo, il en faut environ ${NEED_MB}."
@@ -168,11 +168,21 @@ elif pip3 show Mopidy-Iris >/dev/null 2>&1; then
     pip3 uninstall -y --break-system-packages --root-user-action=ignore Mopidy-Iris || true
 fi
 
-# --- RompR : interface web PHP (nginx + PHP-FPM), dernière version publiée ---------
+# --- Site web de la Pi (nginx + PHP-FPM) : dossier www/ du dépôt sur http://<pi>/ ----
+#     et RompR sur http://<pi>/rompr/ si [mopidy] web = rompr
+SITE=/var/www/hifi
 ROMPR_WEB=/var/www/rompr-web
+log "Site web de la Pi (nginx + PHP) : port $WEBPORT"
+apt_run install nginx php-fpm php-curl php-xml php-mbstring php-sqlite3 php-gd php-intl curl
+# www/ du dépôt -> $SITE (copie fidèle : ce qui a disparu du dépôt disparaît aussi)
+rm -rf "$SITE.new"
+cp -r "$HERE/www" "$SITE.new"
+chown -R root:root "$SITE.new"; chmod -R u=rwX,go=rX "$SITE.new"
+rm -rf "$SITE.old"; [[ -d "$SITE" ]] && mv "$SITE" "$SITE.old"
+mv "$SITE.new" "$SITE"; rm -rf "$SITE.old"
+ROMPR_LOC=""
 if [[ "$WEB" == rompr ]]; then
-    log "Interface web RompR (nginx + PHP)"
-    apt_run install nginx php-fpm php-curl php-xml php-mbstring php-sqlite3 php-gd php-intl curl
+    log "Interface web RompR"
     REL="$(curl -fsSL --max-time 30 https://api.github.com/repos/fatg3erman/RompR/releases/latest || true)"
     TAG="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' <<<"$REL" 2>/dev/null || true)"
     URL="$(python3 -c 'import json,sys
@@ -203,21 +213,22 @@ print(z[0] if z else d["zipball_url"])' <<<"$REL" 2>/dev/null || true)"
     fi
     mkdir -p "$ROMPR_WEB/rompr/prefs" "$ROMPR_WEB/rompr/albumart"
     chown -R www-data:www-data "$ROMPR_WEB/rompr/prefs" "$ROMPR_WEB/rompr/albumart"
-    for d in /etc/php/*/fpm/conf.d; do
-        [[ -d "$d" ]] && install -m 644 "$F/rompr-php.ini" "$d/99-rompr.ini"
-    done
-    sed -e "s#@PORT@#$WEBPORT#g" -e "s#@ROOT@#$ROMPR_WEB#g" "$F/rompr-nginx.conf.in" > /etc/nginx/sites-available/rompr
-    ln -sf /etc/nginx/sites-available/rompr /etc/nginx/sites-enabled/rompr
-    rm -f /etc/nginx/sites-enabled/default
-    nginx -t && systemctl enable nginx && systemctl restart nginx
-    for u in /lib/systemd/system/php*-fpm.service; do
-        [[ -f "$u" ]] && systemctl enable "$(basename "$u")" && systemctl restart "$(basename "$u")"
-    done
-elif [[ -f /etc/nginx/sites-enabled/rompr ]]; then
-    log "RompR désactivé (interface web : $WEB)"
-    rm -f /etc/nginx/sites-enabled/rompr
-    systemctl reload nginx 2>/dev/null || true
+    ROMPR_LOC="$(sed "s#@ROMPR_ROOT@#$ROMPR_WEB#g" "$F/rompr-location.conf.in")"
 fi
+for d in /etc/php/*/fpm/conf.d; do
+    [[ -d "$d" ]] && install -m 644 "$F/rompr-php.ini" "$d/99-rompr.ini"
+done
+python3 - "$F/www-nginx.conf.in" "$WEBPORT" "$SITE" "$ROMPR_LOC" > /etc/nginx/sites-available/hifi <<'PY'
+import sys
+t = open(sys.argv[1], encoding="utf-8").read()
+print(t.replace("@PORT@", sys.argv[2]).replace("@SITE@", sys.argv[3]).replace("@ROMPR@", sys.argv[4]), end="")
+PY
+ln -sf /etc/nginx/sites-available/hifi /etc/nginx/sites-enabled/hifi
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/rompr /etc/nginx/sites-available/rompr
+nginx -t && systemctl enable nginx && systemctl restart nginx
+for u in /lib/systemd/system/php*-fpm.service; do
+    [[ -f "$u" ]] && systemctl enable "$(basename "$u")" && systemctl restart "$(basename "$u")"
+done
 
 # Python 3.13 n'a plus le module imghdr, encore utilisé par Mopidy-Local (recherche
 # par artiste / album) : rétroportage officiel « standard-imghdr ».
@@ -246,8 +257,7 @@ systemctl enable audio-hub-ready.service
 
 # --- Pare-feu (seulement si un pare-feu pi-server est en place) ----------------------
 if [[ -f /etc/nftables.d/00-lan.nft ]] && grep -q 'nftables.d/\[1-9\]' /etc/nftables.conf 2>/dev/null; then
-    PORTS="$HP, $MP"
-    [[ "$WEB" == rompr ]] && PORTS="$PORTS, $WEBPORT"
+    PORTS="$HP, $MP, $WEBPORT"
     log "Pare-feu : Mopidy / interface web (ports $PORTS) limités au réseau local"
     cat > /etc/nftables.d/20-pi-sound-server.nft <<EOF
 # pi-sound-server — réseau local uniquement
@@ -284,7 +294,9 @@ cat <<EOF
   État du routage      : sudo audio-hub status
   Mopidy               : MPD sur le port $MP, API HTTP sur le port $HP
 EOF
+WURL="http://$IP$( [[ "$WEBPORT" == 80 ]] || echo ":$WEBPORT")"
+echo "  Site de la Pi        : $WURL/  (dossier www/ du dépôt)"
 case "$WEB" in
-    rompr) echo "  Interface web        : http://$IP$( [[ "$WEBPORT" == 80 ]] || echo ":$WEBPORT")/rompr/  (RompR)" ;;
+    rompr) echo "  Interface web        : $WURL/rompr/  (RompR)" ;;
     iris)  echo "  Interface web        : http://$IP:$HP/  (Iris)" ;;
 esac

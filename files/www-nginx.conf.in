@@ -1,0 +1,29 @@
+# Généré par pi-sound-server/install.sh — site web de la Pi, réseau local uniquement
+#   http://<pi>/        : dossier www/ du dépôt (déployé dans @SITE@)
+#   http://<pi>/rompr/  : interface RompR (si [mopidy] web = rompr)
+server {
+    listen @PORT@ default_server;
+    listen [::]:@PORT@ default_server;
+    server_name _;
+    root @SITE@;
+    index index.php index.html;
+    client_max_body_size 256M;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        fastcgi_pass unix:/run/php/php-fpm.sock;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+
+    # Fichiers cachés (.git, .env…) jamais servis
+    location ~ /\. {
+        deny all;
+    }
+
+@ROMPR@
+}
