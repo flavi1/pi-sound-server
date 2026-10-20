@@ -122,7 +122,7 @@ apt_run update
 # Pas de plugins « bad » / « ugly » : codecs vidéo, rendu graphique, X11…
 apt_run install pipewire pipewire-bin wireplumber pipewire-alsa dbus-user-session \
     alsa-utils python3 python3-evdev \
-    gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-pipewire gstreamer1.0-alsa gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     mopidy
 if [[ "${CODECS,,}" =~ ^(yes|true|1|on|oui)$ ]]; then
     log "Codecs supplémentaires (AAC, M4A, ALAC, WMA… via ffmpeg) : ≈ 300 Mo"
