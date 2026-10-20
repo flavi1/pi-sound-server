@@ -87,7 +87,21 @@ sont pas filtrés.
 
 Mise à jour manuelle : `sudo pi-server update pi-sound-server`, ou sans pi-server :
 `sudo git -C /opt/pi-sound-server pull && sudo bash /opt/pi-sound-server/install.sh`.
-Votre `/etc/pi-sound-server/audio-hub.conf` n'est jamais écrasé.
+
+**La configuration est celle du dépôt** : à chaque installation / mise à jour,
+`audio-hub.conf` du dépôt remplace `/etc/pi-sound-server/audio-hub.conf` (l'ancien est
+gardé dans `audio-hub.conf.avant-maj`). Pour changer durablement un réglage : le
+changer dans le dépôt. Les réglages propres à une Pi qu'on ne veut pas publier (le
+dépôt est public : **code PIN Bluetooth**) vont dans `/etc/pi-sound-server/local.conf`,
+mêmes sections, lu après `audio-hub.conf` et jamais écrasé :
+
+```ini
+[bluetooth]
+pin = 4821
+```
+
+Lors de la première mise à jour, un code PIN différent de celui du dépôt est déplacé
+automatiquement dans `local.conf`.
 
 ### Démarrage : config.txt
 

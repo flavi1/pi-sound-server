@@ -152,7 +152,9 @@ class Config:
                                        inline_comment_prefixes=None, strict=True)
         cp.optionxform = str
         try:
-            cp.read(path, encoding="utf-8")
+            # local.conf : réglages propres à cette Pi (non publiés), lus en dernier.
+            # Illisible (utilisateur non root) : ignoré, sans erreur.
+            cp.read([path, os.path.join(os.path.dirname(path), "local.conf")], encoding="utf-8")
         except configparser.Error as e:
             die("erreur de syntaxe dans %s :\n%s" % (path, e))
         self.path = path

@@ -80,7 +80,22 @@ ini() {
 
 # --- Configuration ------------------------------------------------------------
 mkdir -p "$CONF_DIR"
-[[ -f "$CONF" ]] || install -m 644 "$HERE/audio-hub.conf" "$CONF"
+# La configuration du dépôt est déployée à chaque installation / mise à jour.
+# L'ancienne est sauvegardée ; un code PIN Bluetooth personnalisé qui n'est pas
+# dans le dépôt (public) est déplacé dans local.conf, jamais écrasé.
+LOCAL="$CONF_DIR/local.conf"
+if [[ -f "$CONF" ]] && ! cmp -s "$HERE/audio-hub.conf" "$CONF"; then
+    OLDPIN="$(ini bluetooth pin)"
+    NEWPIN="$(CONF="$HERE/audio-hub.conf" ini bluetooth pin)"
+    if [[ -n "$OLDPIN" && "$OLDPIN" != "$NEWPIN" && ! -f "$LOCAL" ]]; then
+        install -m 600 /dev/null "$LOCAL"
+        printf '# Réglages propres à cette Pi (lus après audio-hub.conf, jamais écrasés)\n[bluetooth]\npin = %s\n' "$OLDPIN" > "$LOCAL"
+        log "Code PIN Bluetooth personnalisé conservé dans $LOCAL"
+    fi
+    cp -a "$CONF" "$CONF.avant-maj"
+    log "Configuration du dépôt déployée (ancienne : $CONF.avant-maj)"
+fi
+install -m 644 "$HERE/audio-hub.conf" "$CONF"
 install -m 755 "$F/bin/audio-hub" /usr/local/bin/audio-hub
 install -m 755 "$F/bin/audio-hub-diag" /usr/local/bin/audio-hub-diag
 AUSER="$(ini global user)"; AUSER="${AUSER:-hifi}"

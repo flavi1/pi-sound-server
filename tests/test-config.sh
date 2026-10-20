@@ -28,7 +28,7 @@ grep -q 'factory.name = "support.null-audio-sink"' "$PWC" && ok "MASTER : sortie
 grep -q 'monitor.channel-volumes = true' "$PWC" && ok "volume / coupure de MASTER appliqués aux sorties" || fail "monitor.channel-volumes"
 grep -q 'combine-stream' "$PWC" && fail "combine-stream encore utilisé" || ok "plus de combine-stream"
 n_out="$(grep -c 'stream.capture.sink = true' "$PWC")"
-[[ "$n_out" -eq 2 ]] && ok "une boucle par sortie (amp, dac)" || fail "boucles de sortie : $n_out"
+[[ "$n_out" -eq 3 ]] && ok "une boucle par sortie (amp, dac, ao300)" || fail "boucles de sortie : $n_out"
 n_in="$(grep -c 'libpipewire-module-loopback' "$W/gen/.config/pipewire/pipewire.conf.d/50-audio-hub.conf")"
 [[ "$n_in" -ge 1 ]] && ok "$n_in boucle(s) (entrées + sorties)" || fail "aucune boucle"
 
@@ -70,6 +70,13 @@ AUDIO_HUB_CONF="$W/nosec.conf" "${HUB[@]}" check | grep -q 'bluetooth    : inact
 "${HUB[@]}" check | grep -q 'code PIN 1234' && ok "code PIN par défaut 1234" || fail "PIN 1234"
 sed 's/^pin = 1234/pin = 98765/' "$AUDIO_HUB_CONF" > "$W/pin.conf"
 AUDIO_HUB_CONF="$W/pin.conf" "${HUB[@]}" check | grep -q 'code PIN 98765' && ok "code PIN modifiable" || fail "PIN modifié"
+
+echo "== local.conf (réglages propres à la Pi, non publiés)"
+mkdir -p "$W/etc"; cp "$AUDIO_HUB_CONF" "$W/etc/audio-hub.conf"
+printf '[bluetooth]\npin = 4821\n' > "$W/etc/local.conf"
+AUDIO_HUB_CONF="$W/etc/audio-hub.conf" "${HUB[@]}" check | grep -q 'code PIN 4821' \
+    && ok "local.conf prioritaire (code PIN)" || fail "local.conf ignoré"
+"${HUB[@]}" check | grep -q 'sortie ao300' && ok "sortie ao300 (SMSL) déclarée" || fail "ao300 absent"
 
 echo "== erreurs de configuration détectées"
 printf '[global]\nfoo = 1\n' > "$W/bad1.conf"
