@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# =============================================================================
+#  audio-hub-fix-mopidy — corrige l'analyseur de Mopidy (mopidy/audio/scan.py)
+#  pour GStreamer 1.26.2.
+#
+#  GStreamer 1.26.2 (Python) renvoie un « StructureWrapper » là où Mopidy attend
+#  une Gst.Structure : « AttributeError: 'StructureWrapper' object has no attribute
+#  'get_name' ». Conséquences : aucune radio ne peut être ajoutée (« directory or
+#  file not found »), l'indexation de la bibliothèque échoue. Régression de
+#  GStreamer corrigée en 1.26.3 ; le correctif ci-dessous fonctionne avec toutes
+#  les versions (il essaie d'abord l'ancienne méthode).
+#
+#  Idempotent. Relancé après chaque opération dpkg (apt.conf.d) : une mise à jour
+#  du paquet mopidy réinstallerait le fichier d'origine.
+#  audio-hub-fix-mopidy [--quiet] [FICHIER]   (FICHIER : tests)
+# =============================================================================
+import os
+import subprocess
+import sys
+
+MARK = "# pi-sound-server: compat GStreamer 1.26.2"
+OLD = 'mime = msg.get_structure().get_value("caps").get_name()'
+NEW = 'mime = _pi_struct_name(msg.get_structure().get_value("caps"))'
+HELPER = '''
+
+%s (StructureWrapper)
+def _pi_struct_name(value):
+    try:
+        return value.get_name()
+    except AttributeError:
+        pass
+    inner = getattr(value, "_StructureWrapper__structure", None)
+    if inner is not None:
+        return inner.get_name()
+    try:
+        with value as s:
+            return s.get_name()
+    except Exception:
+        pass
+    return str(value).split(",")[0].split(";")[0].strip()
+''' % MARK
+
+
+def patch_text(text):
+    """-> (nouveau texte, modifié ?, reconnu ?)"""
+    if MARK in text:
+        return text, False, True
+    if OLD not in text:
+        return text, False, False
+    return text.replace(OLD, NEW) + HELPER, True, True
+
+
+def target():
+    """Chemin de mopidy/audio/scan.py, sans importer Mopidy ni GStreamer."""
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("mopidy")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return os.path.join(list(spec.submodule_search_locations)[0], "audio", "scan.py")
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--quiet"]
+    quiet = "--quiet" in sys.argv[1:]
+    path = args[0] if args else target()
+    if not path or not os.path.exists(path):
+        if not quiet:
+            print("audio-hub-fix-mopidy : Mopidy introuvable, rien à faire")
+        return 0
+    text = open(path, encoding="utf-8").read()
+    new, changed, known = patch_text(text)
+    if not known:
+        if not quiet:
+            print("audio-hub-fix-mopidy : %s différent de prévu (Mopidy corrigé ?), non modifié" % path)
+        return 0
+    if not changed:
+        if not quiet:
+            print("audio-hub-fix-mopidy : déjà corrigé (%s)" % path)
+        return 0
+    tmp = path + ".pi-sound-server.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new)
+    os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    os.replace(tmp, path)
+    print("audio-hub-fix-mopidy : %s corrigé (GStreamer 1.26.2)" % path)
+    if not args:
+        # Mopidy en cours d'exécution : le relancer pour qu'il prenne le correctif
+        user = "hifi"
+        try:
+            import configparser
+            cp = configparser.ConfigParser(interpolation=None)
+            cp.read("/etc/pi-sound-server/audio-hub.conf", encoding="utf-8")
+            user = cp.get("global", "user", fallback="hifi")
+        except Exception:
+            pass
+        subprocess.run(["systemctl", "--user", "-M", "%s@" % user, "try-restart", "mopidy.service"],
+                       capture_output=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

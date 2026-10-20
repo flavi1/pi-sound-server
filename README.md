@@ -440,6 +440,7 @@ Autres points :
 | Tout est faible | MASTER est bas (25 % ≈ -36 dB au premier démarrage) : `sudo audio-hub volume 60%` |
 | Pas de son du tout sur le HAT | `aplay -l` doit lister la carte ; sinon overlay `rpi-digiampplus,unmute_amp` dans `config.txt` |
 | Volume trop faible sur un seul appareil | son volume matériel doit être à 100 % : `sudo audio-hub diag`, section « Mixeurs ALSA » ; sinon réglage propre de l'appareil (entrée, mode ligne/casque, son propre bouton de volume) |
+| Radios : RompR reste sur « entrant… », Mopidy répond « directory or file not found » ; journal : `'StructureWrapper' object has no attribute 'get_name'` | défaut de Mopidy avec GStreamer 1.26.2 : `sudo audio-hub-fix-mopidy` (appliqué par l'installation et après chaque mise à jour de paquets) |
 | Bluetooth : la Pi n'apparaît pas sur le téléphone | `sudo audio-hub status`, `systemctl status audio-hub-bluetooth` ; `rfkill list` ; redémarrage demandé après `apply` ? ; `discoverable = yes` ? |
 | Bluetooth : le téléphone ne demande pas de code, ou échoue à se jumeler | `sudo journalctl -u audio-hub-bluetooth -b` ; s'il était déjà jumelé : l'oublier des deux côtés et recommencer |
 | Bluetooth : code et jumelage OK, mais la connexion n'aboutit jamais (téléphone déjà associé ou non) | `bluetoothd` attendait la liste des services du téléphone, jamais lue : `audio-hub apply` règle `ReverseServiceDiscovery = false` dans `/etc/bluetooth/main.conf` ; vérifier `grep ReverseServiceDiscovery /etc/bluetooth/main.conf` |

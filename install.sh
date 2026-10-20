@@ -98,6 +98,7 @@ fi
 install -m 644 "$HERE/audio-hub.conf" "$CONF"
 install -m 755 "$F/bin/audio-hub" /usr/local/bin/audio-hub
 install -m 755 "$F/bin/audio-hub-diag" /usr/local/bin/audio-hub-diag
+install -m 755 "$F/bin/audio-hub-fix-mopidy" /usr/local/bin/audio-hub-fix-mopidy
 AUSER="$(ini global user)"; AUSER="${AUSER:-hifi}"
 HP="$(ini mopidy http.port)"; HP="${HP:-6680}"
 MP="$(ini mopidy mpd.port)";  MP="${MP:-6600}"
@@ -250,6 +251,11 @@ if ! python3 -c 'import imghdr' 2>/dev/null; then
     pip3 install --break-system-packages --root-user-action=ignore standard-imghdr \
         || warn "standard-imghdr non installé : Mopidy-Local (recherche) désactivé"
 fi
+
+# Mopidy + GStreamer 1.26.2 : analyseur cassé (radios refusées, indexation en échec).
+# Corrigé maintenant, puis après chaque opération dpkg (mise à jour du paquet mopidy).
+/usr/local/bin/audio-hub-fix-mopidy || warn "correctif de l'analyseur de Mopidy non appliqué"
+install -m 644 "$F/80pi-sound-server-mopidy" /etc/apt/apt.conf.d/80pi-sound-server-mopidy
 
 # --- Unités utilisateur ----------------------------------------------------------
 log "Services utilisateur"

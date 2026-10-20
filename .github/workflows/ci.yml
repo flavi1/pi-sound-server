@@ -22,7 +22,7 @@ jobs:
           shellcheck -S warning install.sh files/bin/audio-hub-diag files/profile.d/*.sh tests/*.sh
       - name: Python (compilation + pyflakes)
         run: |
-          python3 -m py_compile files/bin/audio-hub
+          python3 -m py_compile files/bin/audio-hub files/bin/audio-hub-fix-mopidy
           pipx run pyflakes files/bin/audio-hub
 
   config:
@@ -39,3 +39,5 @@ jobs:
         run: python3 tests/test-links.py
       - name: "Bluetooth : agent de jumelage par code PIN (faux D-Bus)"
         run: python3 tests/test-bluetooth.py
+      - name: "Correctif de l'analyseur de Mopidy (GStreamer 1.26.2)"
+        run: python3 tests/test-fix-mopidy.py
