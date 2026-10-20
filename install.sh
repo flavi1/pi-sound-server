@@ -171,6 +171,7 @@ fi
 # --- Site web de la Pi (nginx + PHP-FPM) : dossier www/ du dépôt sur http://<pi>/ ----
 #     et RompR sur http://<pi>/rompr/ si [mopidy] web = rompr
 SITE=/var/www/hifi
+PRIVATE=/var/lib/pi-sound-server/private
 ROMPR_WEB=/var/www/rompr-web
 log "Site web de la Pi (nginx + PHP) : port $WEBPORT"
 apt_run install nginx php-fpm php-curl php-xml php-mbstring php-sqlite3 php-gd php-intl curl
@@ -180,6 +181,14 @@ cp -r "$HERE/www" "$SITE.new"
 chown -R root:root "$SITE.new"; chmod -R u=rwX,go=rX "$SITE.new"
 rm -rf "$SITE.old"; [[ -d "$SITE" ]] && mv "$SITE" "$SITE.old"
 mv "$SITE.new" "$SITE"; rm -rf "$SITE.old"
+# Dossier privé du site (SQLite…) : hors du web, écrit par PHP (www-data), jamais
+# écrasé. Les fichiers de private/ du dépôt n'y sont copiés que s'ils manquent.
+install -d -m 750 -o www-data -g www-data "$PRIVATE"
+if [[ -d "$HERE/private" ]]; then
+    cp -rn "$HERE/private/." "$PRIVATE/"
+    rm -f "$PRIVATE/.gitkeep"
+    chown -R www-data:www-data "$PRIVATE"
+fi
 ROMPR_LOC=""
 if [[ "$WEB" == rompr ]]; then
     log "Interface web RompR"
@@ -218,10 +227,13 @@ fi
 for d in /etc/php/*/fpm/conf.d; do
     [[ -d "$d" ]] && install -m 644 "$F/rompr-php.ini" "$d/99-rompr.ini"
 done
-python3 - "$F/www-nginx.conf.in" "$WEBPORT" "$SITE" "$ROMPR_LOC" > /etc/nginx/sites-available/hifi <<'PY'
+python3 - "$F/www-nginx.conf.in" "$WEBPORT" "$SITE" "$ROMPR_LOC" "$PRIVATE" > /etc/nginx/sites-available/hifi <<'PY'
 import sys
 t = open(sys.argv[1], encoding="utf-8").read()
-print(t.replace("@PORT@", sys.argv[2]).replace("@SITE@", sys.argv[3]).replace("@ROMPR@", sys.argv[4]), end="")
+for k, v in (("@PORT@", sys.argv[2]), ("@SITE@", sys.argv[3]), ("@ROMPR@", sys.argv[4]),
+             ("@PRIVATE@", sys.argv[5])):
+    t = t.replace(k, v)
+print(t, end="")
 PY
 ln -sf /etc/nginx/sites-available/hifi /etc/nginx/sites-enabled/hifi
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/rompr /etc/nginx/sites-available/rompr

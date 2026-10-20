@@ -314,6 +314,19 @@ fichiers cachés (`.git`, `.env`…) ne sont jamais servis. Par défaut, une pag
 d'accueil renvoie vers RompR (`/rompr/`) et les fichiers (`:8080`). Réseau local
 uniquement (pare-feu), port `[mopidy] web.port` (80).
 
+**Données du site** (base SQLite, fichiers envoyés…) : `/var/lib/pi-sound-server/private`,
+**hors de la racine web** (jamais téléchargeable), en écriture pour PHP (`www-data`),
+jamais touché par les mises à jour. Son chemin est fourni à PHP :
+
+```php
+$db = new PDO('sqlite:' . $_SERVER['PRIVATE_DIR'] . '/site.sqlite');
+```
+
+Le dossier **`private/`** du dépôt sert de fichiers de départ (schéma, base vide…) :
+ils sont copiés sur la Pi **seulement s'ils n'y sont pas déjà**, jamais par-dessus des
+données existantes. Pour sauvegarder les données :
+`sudo tar -C /var/lib/pi-sound-server -czf ~/site-private.tgz private`.
+
 ## 5. Commandes utiles
 
 **Serveur son prêt ?** Au démarrage (et après chaque `audio-hub apply`), le service

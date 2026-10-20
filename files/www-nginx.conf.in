@@ -1,6 +1,7 @@
 # Généré par pi-sound-server/install.sh — site web de la Pi, réseau local uniquement
 #   http://<pi>/        : dossier www/ du dépôt (déployé dans @SITE@)
 #   http://<pi>/rompr/  : interface RompR (si [mopidy] web = rompr)
+#   Données du site (SQLite…) : @PRIVATE@, hors du web, $_SERVER['PRIVATE_DIR'] en PHP
 server {
     listen @PORT@ default_server;
     listen [::]:@PORT@ default_server;
@@ -18,6 +19,7 @@ server {
         fastcgi_pass unix:/run/php/php-fpm.sock;
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PRIVATE_DIR @PRIVATE@;
     }
 
     # Fichiers cachés (.git, .env…) jamais servis
