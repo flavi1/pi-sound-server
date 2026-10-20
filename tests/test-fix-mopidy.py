@@ -29,11 +29,20 @@ SCAN = (
     "            mime = msg.get_structure().get_value(\"caps\").get_name()\n"
     "            if mime.startswith(\"text/\"):\n"
     "                return\n"
+    "        elif msg.type == Gst.MessageType.ERROR:\n"
+    "            caps = missing_message.get_structure().get_value(\"detail\")\n"
+    "            mime = caps.get_structure(0).get_name()\n"
 )
 new, changed, known = fx.patch_text(SCAN)
 check(changed and known and fx.OLD not in new and fx.NEW in new, "ligne fautive remplacée")
 check(fx.patch_text(new) == (new, False, True), "idempotent")
 check(fx.patch_text("autre chose") == ("autre chose", False, False), "fichier inconnu : non modifié")
+check(all(old not in new for old, _ in fx.FIXES), "les deux lignes fautives remplacées (have-type, décodeur manquant)")
+# fichier corrigé par la première version du script (seule la 1re ligne)
+v1 = SCAN.replace(fx.FIXES[0][0], fx.FIXES[0][1]) + fx.HELPER
+new2, ch2, kn2 = fx.patch_text(v1)
+check(ch2 and fx.FIXES[1][1] in new2 and new2.count(fx.MARK) == 1,
+      "fichier déjà corrigé en partie : 2e ligne ajoutée, une seule fonction d'aide")
 
 ns = {}
 exec(compile(new[new.index(fx.MARK):], "scan", "exec"), ns)

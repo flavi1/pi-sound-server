@@ -20,8 +20,15 @@ import subprocess
 import sys
 
 MARK = "# pi-sound-server: compat GStreamer 1.26.2"
-OLD = 'mime = msg.get_structure().get_value("caps").get_name()'
-NEW = 'mime = _pi_struct_name(msg.get_structure().get_value("caps"))'
+# (ligne d'origine, remplacement) : les deux seuls accès concernés (Mopidy 3.4.2)
+FIXES = [
+    ('mime = msg.get_structure().get_value("caps").get_name()',
+     'mime = _pi_struct_name(msg.get_structure().get_value("caps"))'),
+    # fichier dont le décodeur manque (m4a, wma…) : signalé au lieu de tout arrêter
+    ('mime = caps.get_structure(0).get_name()',
+     'mime = _pi_struct_name(caps.get_structure(0))'),
+]
+OLD, NEW = FIXES[0]
 HELPER = '''
 
 %s (StructureWrapper)
@@ -43,12 +50,17 @@ def _pi_struct_name(value):
 
 
 def patch_text(text):
-    """-> (nouveau texte, modifié ?, reconnu ?)"""
-    if MARK in text:
-        return text, False, True
-    if OLD not in text:
+    """-> (nouveau texte, modifié ?, reconnu ?). Applique les corrections manquantes,
+    y compris sur un fichier déjà corrigé par une version précédente du script."""
+    known = MARK in text or any(old in text for old, _ in FIXES)
+    if not known:
         return text, False, False
-    return text.replace(OLD, NEW) + HELPER, True, True
+    new = text
+    for old, rep in FIXES:
+        new = new.replace(old, rep)
+    if MARK not in new:
+        new += HELPER
+    return new, new != text, True
 
 
 def target():
