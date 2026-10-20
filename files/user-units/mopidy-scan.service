@@ -4,8 +4,10 @@ Description=Mopidy : indexation de /media
 
 [Service]
 Type=oneshot
-Nice=10
+Nice=19
+# Priorité minimale (processeur et disque) : la lecture en cours passe toujours avant
 IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
 # laisser le temps au disque d'être monté après la création du dossier
 ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/mopidy --config %h/.config/mopidy/mopidy.conf local scan

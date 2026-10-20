@@ -50,7 +50,7 @@ assert out == "alsasink device=pipewire", "sortie Mopidy par défaut : %s" % out
 assert c["http"]["csrf_protection"] == "false", "RompR : API HTTP accessible au navigateur"
 assert int(c["mpd"]["connection_timeout"]) >= 120, "RompR : connection_timeout MPD"
 assert "iris" not in c and "default_app" not in c["http"], "Iris absent"
-assert c["local"]["enabled"] == "false", "pas d'indexation par défaut"
+assert c["local"]["enabled"] == "true", "indexation activée (configuration du dépôt)"
 assert c["file"]["enabled"] == "true", "navigation par dossiers"
 PY
 sed 's/^web = rompr/web = iris/' "$AUDIO_HUB_CONF" > "$W/iris.conf"
